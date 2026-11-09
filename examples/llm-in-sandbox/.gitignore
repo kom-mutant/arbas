@@ -1,8 +1,0 @@
-logs/
-output/
-mismatch_cases/
-.local/
-__pycache__/
-*.pyc
-
-data/

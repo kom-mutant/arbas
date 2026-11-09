@@ -3,7 +3,7 @@
 
 """Prepare SWE-smith images for Kubernetes rollouts.
 
-The default job template runs ``{image_name}:openai`` so the agent starts
+The default job template runs ``{image_name}:oracle`` so the agent starts
 without a runtime ``pip install``. This script prepares those local tags from
 the per-instance base images and only pulls a base image when it is missing
 from the active Docker daemon.
@@ -27,8 +27,7 @@ DEFAULT_DATASETS = (
     EXAMPLE_DIR / "train_dataset_mixed.jsonl",
     EXAMPLE_DIR / "val_dataset_filtered.jsonl",
 )
-OPENAI_IMAGE_SUFFIX = "openai"
-LOCAL_OPENAI_IMAGE_SUFFIXES = ("agl-openai",)
+OPENAI_IMAGE_SUFFIX = "oracle"
 OPENAI_PACKAGE = "openai"
 
 
@@ -48,12 +47,7 @@ def load_dataset(path: Path) -> list[dict[str, Any]]:
 
 
 def load_datasets(paths: Sequence[Path]) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for path in paths:
-        items.extend(load_dataset(path))
-    if not items:
-        raise ValueError("No SWE-smith instances loaded")
-    return items
+    return [item for path in paths for item in load_dataset(path)]
 
 
 def distinct_images(dataset: list[dict[str, Any]], limit: int | None) -> list[str]:
@@ -93,13 +87,6 @@ def openai_image_name(image_name: str) -> str:
     return f"{image_name}:{OPENAI_IMAGE_SUFFIX}"
 
 
-def local_openai_aliases(image_name: str) -> list[str]:
-    _, tag = split_image_tag(image_name)
-    if tag is not None:
-        return []
-    return [f"{image_name}:{suffix}" for suffix in LOCAL_OPENAI_IMAGE_SUFFIXES]
-
-
 def get_image(client: Any, image: str) -> Any | None:
     try:
         return client.images.get(image)
@@ -111,18 +98,11 @@ def image_exists(client: Any, image: str) -> bool:
     return get_image(client, image) is not None
 
 
-def tag_image(client: Any, source_image: str, target_image: str) -> None:
-    image = get_image(client, source_image)
-    if image is None:
-        raise ValueError(f"source image is not loaded locally: {source_image}")
-    repository, tag = split_image_tag(target_image)
-    if tag is None:
-        raise ValueError(f"target image must include a tag: {target_image}")
-    image.tag(repository, tag=tag)
-
-
 def openai_dockerfile(source_image: str) -> str:
-    install_cmd = f"python -m pip install --no-cache-dir {shlex.quote(OPENAI_PACKAGE)}"
+    install_cmd = (
+        f"python -m pip install --no-cache-dir {shlex.quote(OPENAI_PACKAGE)} "
+        "'pydantic>=2.10,<3' 'numpy>=1.23'"
+    )
     return "".join(
         [
             f"FROM {source_image}\n",
@@ -157,12 +137,6 @@ def prepare_one(
         target_image = openai_image_name(source_image)
         if not force_build and image_exists(client, target_image):
             return ImagePreparationResult(source_image, target_image, "exists")
-
-        if not force_build:
-            for alias in local_openai_aliases(source_image):
-                if image_exists(client, alias):
-                    tag_image(client, alias, target_image)
-                    return ImagePreparationResult(source_image, target_image, f"retagged:{alias}")
 
         if image_exists(client, source_image):
             source_status = "base-local"
@@ -208,7 +182,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-build",
         action="store_true",
-        help="rebuild :openai images even when the target tag already exists",
+        help="rebuild :oracle images even when the target tag already exists",
     )
     return parser.parse_args()
 
@@ -228,8 +202,7 @@ def main() -> None:
     for path in dataset_paths:
         print(f"  {path}")
     print(f"Instances: {len(dataset)} | distinct images: {len(images)}")
-    print("Preparing local :openai images for job-template-openai.yaml")
-    print("Compatible local aliases:", ", ".join(f":{suffix}" for suffix in LOCAL_OPENAI_IMAGE_SUFFIXES))
+    print("Preparing local :oracle images for job-template-openai.yaml")
     for image in images:
         print(f"  {image} -> {openai_image_name(image)}")
 
@@ -257,7 +230,7 @@ def main() -> None:
     if failed:
         names = ", ".join(result.source_image for result in failed)
         raise SystemExit(f"Failed to prepare SWE-smith images: {names}")
-    print(f"Prepared {len(images)} SWE-smith :openai images.")
+    print(f"Prepared {len(images)} SWE-smith :oracle images.")
 
 
 if __name__ == "__main__":

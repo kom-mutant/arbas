@@ -17,7 +17,7 @@ cd "$(dirname "$0")/../.."
 EXAMPLE_DIR="examples/swe_smith"
 AGL_SERVER_PORT="${AGL_SERVER_PORT:-8080}"
 AGL_KEY="${AGL_KEY:-dummy}"
-AGL_MODEL_NAME="${AGL_MODEL_NAME:-Qwen/Qwen3-8B}"
+AGL_MODEL_NAME="${AGL_MODEL_NAME:-Qwen/Qwen3.5-9B}"
 AGL_TRAIN_SCRIPT="${AGL_TRAIN_SCRIPT:-$EXAMPLE_DIR/train_smith_agent.py}"
 AGL_INCLUDE_ROUTED_EXPERTS="${AGL_INCLUDE_ROUTED_EXPERTS:-false}"
 AGL_NAMESPACE="${AGL_NAMESPACE:-default}"
@@ -27,7 +27,7 @@ TRAIN_DATASET_PATH="${AGL_TRAIN_DATASET_PATH-$EXAMPLE_DIR/train_dataset_mixed.js
 VAL_DATASET_PATH="${AGL_VAL_DATASET_PATH-$EXAMPLE_DIR/val_dataset_filtered.jsonl}"
 export VLLM_USE_FLASHINFER_MOE_FP16="${VLLM_USE_FLASHINFER_MOE_FP16:-0}"
 
-if { [ "$ROLE" = "controller" ] || [ "$ROLE" = "trainer" ]; } && \
+if [ "$ROLE" = "trainer" ] && \
    { [ ! -f "$TRAIN_DATASET_PATH" ] || [ ! -f "$VAL_DATASET_PATH" ]; }; then
   echo "ERROR: pre-split SWE-smith datasets are required:" >&2
   echo "  train: $TRAIN_DATASET_PATH" >&2
@@ -102,7 +102,19 @@ elif [ "$ROLE" = "controller" ]; then
   kubectl create namespace "$AGL_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
   echo "=== Creating agent scripts ConfigMap ==="
   kubectl -n "$AGL_NAMESPACE" create configmap swe-smith-agent-scripts \
-    --from-file=smith_agent.py="$EXAMPLE_DIR/agents/smith_agent.py" \
+    --from-file="$EXAMPLE_DIR/hierarchical" \
+    --from-literal=smith-max-turns="${SMITH_MAX_TURNS:-100}" \
+    --from-literal=subagent-max-steps="${SUBAGENT_MAX_STEPS:-20}" \
+    --from-literal=agl-max-tokens="${AGL_MAX_TOKENS:-12288}" \
+    --from-literal=oracle-models="${ORACLE_MODELS:-[]}" \
+    --from-literal=oracle-feedback="${ORACLE_FEEDBACK:-semantic}" \
+    --from-literal=oracle-learn="${ORACLE_LEARN:-true}" \
+    --from-literal=oracle-checkpoint="${ORACLE_CHECKPOINT:-/agl-logs/oracle/linucb.pkl}" \
+    --from-literal=judge-base-url="${JUDGE_BASE_URL:-}" \
+    --from-literal=judge-model="${JUDGE_MODEL:-qwen/qwen3.5-9b}" \
+    --dry-run=client -o yaml | kubectl -n "$AGL_NAMESPACE" apply -f -
+  kubectl -n "$AGL_NAMESPACE" create configmap swe-smith-oracle-scripts \
+    --from-file="$EXAMPLE_DIR/hierarchical/oracle" \
     --dry-run=client -o yaml | kubectl -n "$AGL_NAMESPACE" apply -f -
   echo "=== Starting Agent Lightning controller (runner_type=k8s) ==="
   echo "  Next: start the trainer on Machine B with './run.sh trainer'."

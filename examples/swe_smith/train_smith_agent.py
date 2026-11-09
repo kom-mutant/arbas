@@ -1,4 +1,3 @@
-# Copyright (c) Microsoft. All rights reserved.
 
 from __future__ import annotations
 
@@ -129,7 +128,7 @@ def verl_default_config() -> dict[str, Any]:
             "n_gpus_per_node": 4,
             "val_before_train": True,
             "critic_warmup": 0,
-            "logger": ["console", "wandb"],
+            "logger": ["console", "tensorboard"],
             "project_name": "agentlightning",
             "experiment_name": "swe_smith",
             "nnodes": 1,

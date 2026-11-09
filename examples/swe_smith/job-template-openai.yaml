@@ -1,6 +1,5 @@
-# Uses local ":openai" images prepared by pull_images.py (SWE-smith base image
-# plus the openai package), so the container starts the agent directly without
-# a runtime `pip install openai`.
+# Uses local ":oracle" images prepared by pull_images.py (SWE-smith + OpenAI SDK,
+# Pydantic and NumPy). The local ORACLE subset is mounted with the agent code.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -15,14 +14,22 @@ spec:
       restartPolicy: Never
       containers:
         - name: agent
-          image: {{ (input.image_name ~ ":openai") | yaml_escape }}
-          command: ["bash", "-lc", "set -o pipefail && mkdir -p /agl-logs/new && python /agl/agents/smith_agent.py 2>&1 | tee /agl-logs/new/{{ job_name }}.log"]
+          image: {{ (input.image_name ~ ":oracle") | yaml_escape }}
+          command: ["bash", "-lc", "set -o pipefail && mkdir -p /agl-logs/new && cd /agl && python -m hierarchical.run 2>&1 | tee /agl-logs/new/{{ job_name }}.log"]
           imagePullPolicy: IfNotPresent
           env:
             - name: AGL_TASK_INPUT
               value: {{ input.problem_statement | yaml_escape }}
             - name: SMITH_MAX_TURNS
-              value: "100"
+              valueFrom:
+                configMapKeyRef:
+                  name: swe-smith-agent-scripts
+                  key: smith-max-turns
+            - name: SUBAGENT_MAX_STEPS
+              valueFrom:
+                configMapKeyRef:
+                  name: swe-smith-agent-scripts
+                  key: subagent-max-steps
             # Long-turn penalty (plan A): only SOLVED (reward==1) rollouts are
             # penalized for burning turns. reward = 1 - λ·clip((n_turns-T0)/(max_turns-T0),0,1).
             - name: SMITH_LEN_PEN_T0
@@ -39,9 +46,49 @@ spec:
             - name: SMITH_PROMPT_PEN_MAX
               value: "0.1"
             - name: AGL_MAX_TOKENS
-              value: "12288"
+              valueFrom:
+                configMapKeyRef:
+                  name: swe-smith-agent-scripts
+                  key: agl-max-tokens
             - name: SMITH_OBS_CHAR_CAP
               value: "6000"
+            - name: HIER_OUTPUT_DIR
+              value: "/agl-logs/new/{{ job_name }}"
+            - name: ORACLE_MODELS
+              valueFrom:
+                configMapKeyRef:
+                  name: swe-smith-agent-scripts
+                  key: oracle-models
+            - name: ORACLE_CHECKPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: swe-smith-agent-scripts
+                  key: oracle-checkpoint
+            - name: ORACLE_LEARN
+              valueFrom:
+                configMapKeyRef:
+                  name: swe-smith-agent-scripts
+                  key: oracle-learn
+            - name: ORACLE_FEEDBACK
+              valueFrom:
+                configMapKeyRef:
+                  name: swe-smith-agent-scripts
+                  key: oracle-feedback
+            - name: JUDGE_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: swe-smith-agent-scripts
+                  key: judge-base-url
+            - name: JUDGE_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: swe-smith-agent-scripts
+                  key: judge-model
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: swe-smith-openrouter
+                  key: api-key
           resources:
             requests:
               cpu: "50m"
@@ -51,7 +98,10 @@ spec:
               memory: "6Gi"
           volumeMounts:
             - name: agent-scripts
-              mountPath: /agl/agents
+              mountPath: /agl/hierarchical
+              readOnly: true
+            - name: oracle-scripts
+              mountPath: /agl/hierarchical/oracle
               readOnly: true
             - name: rollout-logs
               mountPath: /agl-logs
@@ -64,3 +114,7 @@ spec:
           hostPath:
             path: /agl-logs
             type: DirectoryOrCreate
+        - name: oracle-scripts
+          configMap:
+            name: swe-smith-oracle-scripts
+            defaultMode: 0755

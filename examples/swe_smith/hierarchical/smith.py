@@ -418,6 +418,7 @@ def capture_patch() -> str:
             [*_git_base(), "-c", "core.fileMode=false", "diff", "HEAD"],
             cwd=TESTBED,
             capture_output=True,
+            check=True,
             text=True,
             timeout=60,
         )

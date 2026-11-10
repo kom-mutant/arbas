@@ -171,6 +171,36 @@ def test_invalid_tools_and_arguments_are_feedback_not_execution(config):
     assert "Unknown agent" in client.requests[3]["messages"][-1]["content"]
 
 
+def test_orchestrator_retries_tool_call_returned_as_text(config):
+    root = Client(
+        [
+            reply(tool="create_subagent", arguments={"name": "research"}),
+            reply(tool="assign_task", arguments={"agent": "research", "prompt": "Inspect"}),
+            reply('<think>Delegate</think>\n<tool_call>\n{"name": "assign_task",'),
+            reply(tool="assign_task", arguments={"agent": "research_1", "prompt": "Inspect"}),
+            reply("Done"),
+        ]
+    )
+    worker = Client([reply("Inspected")])
+
+    result = Orchestrator(config, root, worker).run("Issue")
+
+    assert "Available: research_1" in root.requests[2]["messages"][-1]["content"]
+    assert "Retry one tool call" in root.requests[3]["messages"][-1]["content"]
+    assert [assignment.agent_name for assignment in result.assignments] == ["research_1"]
+    assert len(worker.requests) == 1
+    assert result.orchestrator.summary == "Done"
+
+
+def test_worker_retries_unparsed_tool_call(config):
+    client = Client([reply("Attempting Bash", finish="tool_calls"), reply("Done")])
+    worker = SubAgent(AgentSpec(name="fix_1", profile="fix", system_prompt="Fix"), client, config)
+    result = worker.execute("Issue", TaskAssignment(agent_name="fix_1", prompt="Fix"), config.subagent_model)
+
+    assert "Retry one tool call" in client.requests[1]["messages"][-1]["content"]
+    assert result.summary == "Done"
+
+
 @pytest.mark.parametrize("actor", ["orchestrator", "worker"])
 def test_length_cutoff_never_executes_tools(config, actor):
     client = Client([reply(tool="bash", arguments={"command": "touch unexpected"}, finish="length")])
@@ -611,3 +641,38 @@ def test_assignment_patches_are_captured_before_later_workers_change_source(task
     assert "+    return a + b" not in results[0].patch_after
     assert results[1].patch_before == results[0].patch_after
     assert "+    return a + b" in results[1].patch_after
+
+
+def test_training_parser_follows_effective_model(tmp_path):
+    pytest.importorskip("verl")
+    from examples.swe_smith.train_smith_agent import build_config
+
+    (tmp_path / "config.json").write_text('{"model_type": "qwen3_5"}')
+    override = "actor_rollout_ref.model.path="
+    local = build_config(config_overrides=[override + str(tmp_path)])
+    other = build_config(config_overrides=[override + "Qwen/Qwen3-8B"])
+
+    assert local.actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser == "qwen3_coder"
+    assert "chat_template" not in local.actor_rollout_ref.rollout.engine_kwargs.vllm
+    assert other.actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser == "hermes"
+
+
+def test_training_smoke_keeps_lora_settings(tmp_path):
+    pytest.importorskip("verl")
+    from omegaconf import OmegaConf
+
+    from examples.swe_smith.train_smith_agent import DEFAULT_CONFIG, build_config
+
+    settings = OmegaConf.load(DEFAULT_CONFIG)
+    settings.actor_rollout_ref.model.lora_rank = 16
+    config_path = tmp_path / "experiment.yaml"
+    OmegaConf.save(settings, config_path)
+    config = build_config(config_path=config_path, smoke=True)
+
+    assert config.actor_rollout_ref.model.lora_rank == 16
+    assert config.actor_rollout_ref.model.lora.merge is True
+    assert config.actor_rollout_ref.rollout.n == 4
+    assert config.trainer.total_training_steps == 1
+    assert config.data.train_files == str(tmp_path / "smoke_train.jsonl")
+    assert config.agentlightning.trace_aggregator.trajectory_max_response_length == config.data.max_response_length
+    assert "agents" not in config

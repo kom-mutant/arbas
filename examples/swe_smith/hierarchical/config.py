@@ -1,10 +1,11 @@
 import json
 import os
-from typing import Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
 from .types import AgentSpec, ModelSettings, TaskAssignment
+
 if TYPE_CHECKING:
     from .routing import ModelRouter
 
@@ -102,12 +103,8 @@ def load_config() -> Config:
         oracle_models=json.loads(os.environ.get("ORACLE_MODELS", "[]")),
     )
     defaults = config.judge_settings()
-    judge_model_env = os.environ.get("JUDGE_MODEL")
-    judge_model_name = judge_model_env or (
-        config.subagent_model.model if defaults.model == "auto" else defaults.model
-    )
     config.judge_model = ModelSettings(
-        model=judge_model_name,
+        model=os.environ.get("JUDGE_MODEL") or defaults.model,
         temperature=defaults.temperature,
         max_tokens=int(os.environ.get("JUDGE_MAX_TOKENS", defaults.max_tokens)),
         reasoning=json.loads(os.environ.get("JUDGE_REASONING", "null")),

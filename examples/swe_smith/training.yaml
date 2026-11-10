@@ -1,0 +1,150 @@
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen3.5-9B
+    lora_rank: 0  # 0 = full fine-tuning, e.g. 16 = LoRA
+    lora_alpha: 32
+    target_modules: all-linear
+    lora:
+      merge: true  # Sync merged weights to vLLM.
+    use_remove_padding: true
+    use_fused_kernels: true
+    fused_kernel_options:
+      impl_backend: torch
+    enable_gradient_checkpointing: true
+  actor:
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_max_token_len_per_gpu: 16384
+    optim:
+      lr: 1e-6
+    use_kl_loss: false
+    kl_loss_coef: 0.0
+    entropy_coeff: 0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+      entropy_from_logits_with_chunking: true
+    loss_agg_mode: token-mean
+  rollout:
+    name: vllm
+    mode: async
+    n: 8
+    tensor_model_parallel_size: 1
+    log_prob_micro_batch_size_per_gpu: 1
+    multi_turn:
+      format: hermes
+    gpu_memory_utilization: 0.8
+    max_model_len: 81920
+    max_num_batched_tokens: 8192
+    enforce_eager: false
+    engine_kwargs:
+      vllm:
+        enable_auto_tool_choice: true
+        moe_backend: triton
+    temperature: 1
+    val_kwargs:
+      temperature: 0.7
+      do_sample: true
+    enable_prefix_caching: true
+    enable_chunked_prefill: true
+    checkpoint_engine:
+      update_weights_bucket_megabytes: 4096
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+
+data:
+  # Relative paths are resolved from this YAML.
+  train_files: train_dataset_mixed.jsonl
+  val_files: val_dataset_filtered.jsonl
+  train_batch_size: 16
+  max_prompt_length: 65536
+  max_response_length: 65536
+  truncation: error
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+trainer:
+  n_gpus_per_node: 4
+  nnodes: 1
+  val_before_train: true
+  critic_warmup: 0
+  logger: [console, tensorboard]
+  project_name: agentlightning
+  experiment_name: swe_smith
+  nccl_timeout: 1800
+  test_freq: 16
+  save_freq: 16
+  total_epochs: 4
+  total_training_steps: 1000
+
+agentlightning:
+  rollout_timeout_seconds: 5400
+  reward_fillna_value: 0.0
+  max_ppo_update_times: 2
+  trace_aggregator:
+    level: trajectory
+    trajectory_max_prompt_length: ${data.max_prompt_length}
+    trajectory_max_response_length: ${data.max_response_length}
+  async_rollout:
+    enabled: false
+    async_train_batch_size: 50
+
+agents:
+  SMITH_MAX_TURNS: 100
+  SUBAGENT_MAX_STEPS: 20
+  AGL_MAX_TOKENS: 12288
+  SMITH_OBS_CHAR_CAP: 6000
+  SMITH_LEN_PEN_T0: 80
+  SMITH_LEN_PEN_LAMBDA: 0.1
+  SMITH_PROMPT_PEN_SOFT_START: 50000
+  SMITH_PROMPT_PEN_HARD_CAP: 64000
+  SMITH_PROMPT_PEN_MAX: 0.1
+  SUBAGENT_MODEL: qwen/qwen3.5-9b
+  ORACLE_MODELS: []  # Empty pool uses SUBAGENT_MODEL directly.
+  ORACLE_FEEDBACK: semantic
+  ORACLE_LEARN: true
+  ORACLE_CHECKPOINT: /agl-logs/oracle/linucb.pkl
+  ORACLE_COST_WEIGHT: 0.2
+  ORACLE_COST_REF: 10000
+  ORACLE_SEED: 0
+  JUDGE_BASE_URL: ""
+  JUDGE_MODEL: qwen/qwen3.5-9b
+  JUDGE_MAX_TOKENS: 1024
+
+# Overrides for run.sh controller --smoke and run.sh trainer --smoke.
+smoke:
+  agents:
+    SMITH_MAX_TURNS: 12
+    SUBAGENT_MAX_STEPS: 8
+    AGL_MAX_TOKENS: 3072
+    ORACLE_MODELS: [qwen/qwen3.5-9b]
+    ORACLE_LEARN: false
+    ORACLE_CHECKPOINT: /tmp/agl-grpo-smoke/linucb.pkl
+  data:
+    train_files: smoke_train.jsonl
+    val_files: smoke_val.jsonl
+    train_batch_size: 1
+    max_prompt_length: 8192
+    max_response_length: 8192
+  actor_rollout_ref:
+    actor:
+      ppo_mini_batch_size: 1
+    rollout:
+      n: 4
+      max_model_len: 16384
+      gpu_memory_utilization: 0.7
+  trainer:
+    n_gpus_per_node: 1
+    val_before_train: false
+    total_training_steps: 1
+    test_freq: -1
+    save_freq: -1
+    resume_mode: disable
+  agentlightning:
+    rollout_timeout_seconds: 900

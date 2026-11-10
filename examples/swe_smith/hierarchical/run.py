@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from openai import APIError, OpenAI
@@ -81,22 +81,17 @@ def judge_assignments(
     if not assignments:
         return []
     judge_url, judge_key = address
-    with OpenAI(base_url=judge_url, api_key=judge_key, timeout=config.api_timeout, max_retries=3) as client:
-        if len(assignments) == 1:
-            judgment = evaluate_assignment(client, problem, assignments[0], config)
-            assignments[0].judgment = judgment
-            return [judgment.score]
-
-        with ThreadPoolExecutor(max_workers=min(4, len(assignments))) as executor:
-            future_to_result = {
-                executor.submit(evaluate_assignment, client, problem, res, config): res
-                for res in assignments
-            }
-            for future in as_completed(future_to_result):
-                res = future_to_result[future]
-                res.judgment = future.result()
-
-    return [res.judgment.score if res.judgment else None for res in assignments]
+    scores = []
+    with (
+        OpenAI(base_url=judge_url, api_key=judge_key, timeout=config.api_timeout, max_retries=3) as client,
+        ThreadPoolExecutor(max_workers=min(4, len(assignments))) as executor,
+    ):
+        futures = [executor.submit(evaluate_assignment, client, problem, result, config) for result in assignments]
+        for result, future in zip(assignments, futures):
+            judgment = future.result()
+            result.judgment = judgment
+            scores.append(judgment.score)
+    return scores
 
 
 def training_reward(raw_reward: float, resolved: bool, result: TaskResult, config: Config) -> float:

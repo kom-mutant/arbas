@@ -108,7 +108,8 @@ python -m examples.swe_smith.hierarchical.run
 
 Существующие `run.sh`, `pull_images.py` и `job-template-openai.yaml` подключены
 к новому пакету; схема запуска сервера, контроллера и тренера прежняя. Образы
-с тегом `:oracle` получают Pydantic, OpenAI SDK и NumPy.
+с тегом `:arbas` получают Pydantic, OpenAI SDK и NumPy.
+Готовому образу с прежним тегом `:oracle` можно добавить тег `:arbas` без пересборки.
 Старые `:openai` и `:agl-openai` не переиспользуются: в них нет NumPy.
 В кластере требуется Secret `swe-smith-openrouter` с ключом `api-key` и сетевой
 доступ из контейнера к API исполнителей. Веса обучаются только по обращениям
@@ -265,12 +266,34 @@ pickle записывает полное имя Python-модуля класса
 
 ### Первый шаг GRPO
 
-Из корня репозитория. В `smoke_train.jsonl` и `smoke_val.jsonl` лежат две реальные
+На GPU-сервере из корня репозитория, с `uv` в `PATH`:
+
+```bash
+bash examples/swe_smith/setup_training.sh
+source .venv/bin/activate
+```
+
+Это один набор зависимостей для короткого и обычного обучения на Linux x86_64
+с Python 3.12 и CUDA 12.9. Установщик собирает пакет veRL 0.8.0 с изменениями
+из [veRL #6551](https://github.com/verl-project/verl/pull/6551) для NumPy 2,
+сохраняя интерфейс тренера Agent Lightning. FlashAttention и causal-conv1d
+скачиваются готовыми сборками под PyTorch 2.11.0 и CUDA 12.9.
+
+Параметры эксперимента находятся в [`training.yaml`](../training.yaml).
+`actor_rollout_ref.model.path` задаёт модель оркестратора. Там же
+`lora_rank: 0` означает обучение всех параметров, а, например, `lora_rank: 16`
+включает LoRA. В этом же файле задаются learning rate, число GPU и попыток на
+задачу, лимиты контекста, датасеты, пул моделей ORACLE и модель судьи. Блок
+`smoke` переопределяет настройки короткого прогона. Для отдельного конфига
+задайте `AGL_TRAIN_CONFIG` на обеих машинах. Ключи и адреса подключения
+задаются отдельно через переменные окружения и Kubernetes Secret.
+
+В `smoke_train.jsonl` и `smoke_val.jsonl` лежат две реальные
 задачи `oauthlib` из [SWE-smith-py](https://huggingface.co/datasets/SWE-bench/SWE-smith-py)
 на одном образе. Сохранены все FAIL_TO_PASS и только те PASS_TO_PASS, что лежат
 в тех же файлах, как при `SMITH_F2P_ONLY=1`. Эталонные патчи не включены.
 
-1. Там, где готовятся образы для Kubernetes, соберите `:oracle` и убедитесь, что
+1. Там, где готовятся образы для Kubernetes, соберите `:arbas` и убедитесь, что
    кластер видит этот тег. В выделенном namespace нужен Secret `swe-smith-openrouter`
    с ключом `api-key`.
 
@@ -281,30 +304,41 @@ pickle записывает полное имя Python-модуля класса
    ```
 
 2. На GPU-сервере запустите `bash examples/swe_smith/run.sh server`. Для сервера,
-   контроллера и тренера используйте один `AGL_KEY` и одну модель. На машине с
+   контроллера и тренера используйте один `AGL_KEY`. На машине с
    доступом к Kubernetes задайте `AGL_NAMESPACE` и `AGL_SERVER_PUBLIC_HOST` —
    адрес GPU-сервера, доступный контроллеру и контейнерам. Затем запустите контроллер:
 
    ```bash
-   SMITH_MAX_TURNS=12 SUBAGENT_MAX_STEPS=8 AGL_MAX_TOKENS=3072 \
-   ORACLE_MODELS='["qwen/qwen3.5-9b"]' ORACLE_FEEDBACK=semantic \
-   JUDGE_MODEL=qwen/qwen3.5-9b ORACLE_LEARN=false \
-   ORACLE_CHECKPOINT=/tmp/agl-grpo-smoke/linucb.pkl \
-   bash examples/swe_smith/run.sh controller
+   bash examples/swe_smith/run.sh controller --smoke
    ```
 
    Один вариант модели исполнителя здесь достаточен: проверяем получение оценки
    и время судьи. Состояние ORACLE для этого теста не обновляется.
 
-3. В другом терминале GPU-сервера запустите `bash examples/swe_smith/smoke_train.sh 1`
-   для одной выделенной GPU. Скрипт даёт четыре попытки на одну задачу и один шаг
+3. В другом терминале GPU-сервера запустите `bash examples/swe_smith/run.sh trainer --smoke`
+   на одной выделенной GPU. Профиль даёт четыре попытки на одну задачу и один шаг
    GRPO; валидация, возобновление и сохранение весов отключены.
 
+Для обычного обучения запустите контроллер и тренер без `--smoke`. Укажите свои
+подготовленные JSONL в `data.train_files` и `data.val_files`.
+
+На каждой машине `run.sh` сохраняет логи своих процессов в `outputs/swe-smith`.
+Задайте `AGL_RUN_DIR`, чтобы разделить запуски. На GPU-сервере там же сохраняются
+метрики TensorBoard. Логи отдельных задач Kubernetes лежат на узле кластера в
+`/agl-logs/new`. Чтобы открыть TensorBoard на машине с логами тренера:
+
+```bash
+tensorboard --logdir outputs/swe-smith/tensorboard --host 127.0.0.1
+```
+
 В логе тренера проверьте `training/n_rollouts_w_reward` (ожидаем 4),
-`training/n_sample_trained` (должно быть больше нуля) и `timing_s/update_actor`.
-Если награды в группе одинаковые, шаг проверяет работу цепочки, но не даёт
-относительного сигнала GRPO. В логах контейнеров `Judge stage` показывает число
-оценённых назначений и время всего этапа; `rollout_wall_s` — время всей попытки.
+`training/n_sample_trained` (больше нуля), `timing_s/update_actor` и
+`timing_s/update_weights`. Последние две метрики показывают, что вызовы обновления
+актора и передачи весов в vLLM завершились. Для проверки сигнала GRPO
+`training/n_zero_adv_groups` должно быть меньше `training/n_groups`. При одинаковых
+наградах прогон проверяет выполнение шага, но не подтверждает изменение параметров
+от сигнала GRPO. В логах контейнеров `Judge stage` показывает число оценённых
+назначений и время этапа, а `rollout_wall_s` — время всей попытки.
 
 Проверка без внешних API и GPU:
 

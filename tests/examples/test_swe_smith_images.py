@@ -63,7 +63,7 @@ class _FakeClient:
 
 
 def test_openai_image_name_matches_job_template_convention() -> None:
-    assert pull_images.openai_image_name("jyangballin/swesmith.foo") == ("jyangballin/swesmith.foo:oracle")
+    assert pull_images.openai_image_name("jyangballin/swesmith.foo") == ("jyangballin/swesmith.foo:arbas")
 
 
 def test_openai_image_name_rejects_already_tagged_sources() -> None:
@@ -72,7 +72,7 @@ def test_openai_image_name_rejects_already_tagged_sources() -> None:
 
 
 def test_prepare_one_skips_when_openai_image_already_loaded() -> None:
-    client = _FakeClient({"repo/image:oracle"})
+    client = _FakeClient({"repo/image:arbas"})
 
     result = pull_images.prepare_one(
         client,
@@ -100,7 +100,7 @@ def test_prepare_one_builds_openai_layer_from_local_base_without_pulling() -> No
     assert client.images.pulled == []
     assert len(client.images.built) == 1
     tag, dockerfile, pull = client.images.built[0]
-    assert tag == "repo/image:oracle"
+    assert tag == "repo/image:arbas"
     assert "FROM repo/image" in dockerfile
     assert "pip install --no-cache-dir openai" in dockerfile
     assert "numpy>=1.23" in dockerfile
@@ -119,7 +119,7 @@ def test_prepare_one_does_not_reuse_images_without_oracle_dependencies() -> None
     )
 
     assert result.status == "base-local,built"
-    assert "repo/image:oracle" in client.images.existing
+    assert "repo/image:arbas" in client.images.existing
     assert client.images.pulled == []
     assert len(client.images.built) == 1
 
@@ -136,7 +136,7 @@ def test_prepare_one_pulls_missing_base_only_when_allowed() -> None:
 
     assert result.status == "base-pulled,built"
     assert client.images.pulled == ["repo/image"]
-    assert client.images.built[0][0] == "repo/image:oracle"
+    assert client.images.built[0][0] == "repo/image:arbas"
 
 
 def test_prepare_one_can_require_preloaded_base_image() -> None:

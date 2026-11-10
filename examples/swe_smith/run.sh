@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Copyright (c) Microsoft. All rights reserved.
 
 set -euo pipefail
 ROLE="${1:-}"
 if [ "$ROLE" != "server" ] && [ "$ROLE" != "controller" ] && [ "$ROLE" != "trainer" ]; then
-  echo "Usage: $0 {server|controller|trainer} [extra args passed to trainer]"
+  echo "Usage: $0 {server|controller|trainer} [--smoke for controller and trainer]"
   echo "  server      → Machine B: agl-server (store + API only, no model backend)"
   echo "  controller  → Machine A: agent ConfigMap + agl-controller (k8s runner)"
   echo "  trainer     → Machine B: VERL trainer (enqueues rollouts)"
@@ -17,85 +16,97 @@ cd "$(dirname "$0")/../.."
 EXAMPLE_DIR="examples/swe_smith"
 AGL_SERVER_PORT="${AGL_SERVER_PORT:-8080}"
 AGL_KEY="${AGL_KEY:-dummy}"
-AGL_MODEL_NAME="${AGL_MODEL_NAME:-Qwen/Qwen3.5-9B}"
-AGL_TRAIN_SCRIPT="${AGL_TRAIN_SCRIPT:-$EXAMPLE_DIR/train_smith_agent.py}"
+AGL_TRAIN_CONFIG="${AGL_TRAIN_CONFIG:-$EXAMPLE_DIR/training.yaml}"
+export AGL_TRAIN_CONFIG
+DEFAULT_TRAIN_SCRIPT="$EXAMPLE_DIR/train_smith_agent.py"
+AGL_TRAIN_SCRIPT="${AGL_TRAIN_SCRIPT:-$DEFAULT_TRAIN_SCRIPT}"
 AGL_INCLUDE_ROUTED_EXPERTS="${AGL_INCLUDE_ROUTED_EXPERTS:-false}"
 AGL_NAMESPACE="${AGL_NAMESPACE:-default}"
 PUBLIC_HOST="${AGL_SERVER_PUBLIC_HOST:-0.0.0.0}"
 SERVER_URL="http://${PUBLIC_HOST}:${AGL_SERVER_PORT}"
-TRAIN_DATASET_PATH="${AGL_TRAIN_DATASET_PATH-$EXAMPLE_DIR/train_dataset_mixed.jsonl}"
-VAL_DATASET_PATH="${AGL_VAL_DATASET_PATH-$EXAMPLE_DIR/val_dataset_filtered.jsonl}"
 export VLLM_USE_FLASHINFER_MOE_FP16="${VLLM_USE_FLASHINFER_MOE_FP16:-0}"
 
-if [ "$ROLE" = "trainer" ] && \
-   { [ ! -f "$TRAIN_DATASET_PATH" ] || [ ! -f "$VAL_DATASET_PATH" ]; }; then
-  echo "ERROR: pre-split SWE-smith datasets are required:" >&2
-  echo "  train: $TRAIN_DATASET_PATH" >&2
-  echo "  val:   $VAL_DATASET_PATH" >&2
-  echo "Set AGL_TRAIN_DATASET_PATH and AGL_VAL_DATASET_PATH to existing JSONL files." >&2
-  exit 1
-fi
+umask 077
+run_dir="${AGL_RUN_DIR:-$PWD/outputs/swe-smith}"
+mkdir -p "$run_dir"
+run_dir="$(cd "$run_dir" && pwd)"
+export AGL_KEY TENSORBOARD_DIR="${TENSORBOARD_DIR:-$run_dir/tensorboard}"
+hydra_logs=("hydra.run.dir=$run_dir" hydra.output_subdir=null 'hydra.job_logging.root.handlers=[console]')
+echo "Log: $run_dir/$ROLE.log"
+
+run_logged() {
+  "$@" 2>&1 | python -u -c '
+import os
+import sys
+
+key = os.environ["AGL_KEY"]
+last_progress = None
+for line in sys.stdin:
+    if "AglRolloutManager: completed=" in line:
+        if line == last_progress:
+            continue
+        last_progress = line
+    sys.stdout.write(line.replace(key, "[redacted]"))
+' | tee -a "$run_dir/$ROLE.log"
+}
 
 if [ "$ROLE" = "server" ]; then
+  if [ -z "${AGL_MODEL_NAME:-}" ]; then
+    AGL_MODEL_NAME="$(python -c '
+import sys
+from omegaconf import OmegaConf
+print(OmegaConf.load(sys.argv[1]).actor_rollout_ref.model.path)
+' "$AGL_TRAIN_CONFIG")"
+  fi
   echo "=== SWE-smith :: server (Machine B) ==="
   echo "  Public server URL: $SERVER_URL"
   echo "  No backend model is started here — this is just the store + REST API."
   echo "  Readiness criterion: GET ${SERVER_URL%/}/healthz returns 200."
   echo "=== Starting Agent Lightning server (no model backend) ==="
-  agl-server \
+  run_logged agl-server \
     port="$AGL_SERVER_PORT" \
     host="${AGL_SERVER_BIND:-0.0.0.0}" \
-    key="$AGL_KEY" \
+    "key=\${oc.env:AGL_KEY}" \
     default_proxy.model_name="$AGL_MODEL_NAME" \
-    default_proxy.include_routed_experts="$AGL_INCLUDE_ROUTED_EXPERTS" &
-  SERVER_PID=$!
-  cleanup() {
-    if kill -0 "$SERVER_PID" 2>/dev/null; then
-      kill "$SERVER_PID"
-    fi
-  }
-  trap cleanup EXIT INT TERM
-  ready=false
-  for _ in $(seq 1 30); do
-    if curl -sf "http://localhost:${AGL_SERVER_PORT}/healthz" >/dev/null 2>&1; then
-      ready=true
-      break
-    fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-      echo "ERROR: agl-server exited before becoming healthy." >&2
-      exit 1
-    fi
-    sleep 1
-  done
-  if [ "$ready" != true ]; then
-    echo "ERROR: server not healthy after 30s (http://localhost:${AGL_SERVER_PORT}/healthz)." >&2
-    exit 1
-  fi
-  echo "  server ready: http://localhost:${AGL_SERVER_PORT}/healthz → 200"
-  echo "  Next: start the controller on Machine A, then './run.sh trainer' here."
-  wait "$SERVER_PID"
+    default_proxy.include_routed_experts="$AGL_INCLUDE_ROUTED_EXPERTS" \
+    "${hydra_logs[@]}"
 elif [ "$ROLE" = "trainer" ]; then
   echo "=== SWE-smith :: trainer (Machine B) ==="
   echo "  Server: http://localhost:$AGL_SERVER_PORT"
-  echo "  Model: $AGL_MODEL_NAME"
-  if ! curl -sf "http://localhost:$AGL_SERVER_PORT/healthz" >/dev/null 2>&1; then
+  if ! curl -fsS --max-time 5 "http://localhost:$AGL_SERVER_PORT/healthz" >/dev/null 2>&1; then
     echo "ERROR: server not reachable at http://localhost:$AGL_SERVER_PORT — start './run.sh server' first."
     exit 1
   fi
   echo "=== Running SWE-smith training ==="
-  python "$AGL_TRAIN_SCRIPT" \
+  if [ "$AGL_TRAIN_SCRIPT" != "$DEFAULT_TRAIN_SCRIPT" ]; then
+    set -- --agl-key "$AGL_KEY" \
+      --train-dataset-path "${AGL_TRAIN_DATASET_PATH:-$EXAMPLE_DIR/train_dataset_mixed.jsonl}" \
+      --val-dataset-path "${AGL_VAL_DATASET_PATH:-$EXAMPLE_DIR/val_dataset_filtered.jsonl}" \
+      --model "${AGL_MODEL_NAME:-Qwen/Qwen3.5-9B}" \
+      --run-name "${AGL_RUN_NAME:-distributed}" "$@"
+  fi
+  run_logged python -u "$AGL_TRAIN_SCRIPT" \
     --agl-base-url "http://localhost:$AGL_SERVER_PORT" \
-    --agl-key "$AGL_KEY" \
-    --train-dataset-path "$TRAIN_DATASET_PATH" \
-    --val-dataset-path "$VAL_DATASET_PATH" \
-    --model "$AGL_MODEL_NAME" \
-    --run-name distributed \
     "$@"
 elif [ "$ROLE" = "controller" ]; then
+  settings="$(python -c '
+import json
+import os
+import sys
+from omegaconf import OmegaConf
+
+config = OmegaConf.load(sys.argv[1])
+agents = config.agents
+if sys.argv[2:] == ["--smoke"]:
+    agents = OmegaConf.merge(agents, config.smoke.agents)
+for key, value in OmegaConf.to_container(agents, resolve=True).items():
+    default = value if isinstance(value, str) else json.dumps(value)
+    print(f"{key}={os.environ.get(key, default)}")
+' "$AGL_TRAIN_CONFIG" "$@")"
   echo "=== SWE-smith :: controller (Machine A) ==="
   echo "  Connecting to server: $SERVER_URL"
   echo "  Namespace: $AGL_NAMESPACE"
-  if ! curl -sf "${SERVER_URL}/healthz" >/dev/null 2>&1; then
+  if ! curl -fsS --max-time 5 "${SERVER_URL}/healthz" >/dev/null 2>&1; then
     echo "WARNING: server not reachable at $SERVER_URL — start './run.sh server' on Machine B first."
   fi
   echo "=== Ensuring namespace '$AGL_NAMESPACE' exists ==="
@@ -103,25 +114,21 @@ elif [ "$ROLE" = "controller" ]; then
   echo "=== Creating agent scripts ConfigMap ==="
   kubectl -n "$AGL_NAMESPACE" create configmap swe-smith-agent-scripts \
     --from-file="$EXAMPLE_DIR/hierarchical" \
-    --from-literal=smith-max-turns="${SMITH_MAX_TURNS:-100}" \
-    --from-literal=subagent-max-steps="${SUBAGENT_MAX_STEPS:-20}" \
-    --from-literal=agl-max-tokens="${AGL_MAX_TOKENS:-12288}" \
-    --from-literal=oracle-models="${ORACLE_MODELS:-[]}" \
-    --from-literal=oracle-feedback="${ORACLE_FEEDBACK:-semantic}" \
-    --from-literal=oracle-learn="${ORACLE_LEARN:-true}" \
-    --from-literal=oracle-checkpoint="${ORACLE_CHECKPOINT:-/agl-logs/oracle/linucb.pkl}" \
-    --from-literal=judge-base-url="${JUDGE_BASE_URL:-}" \
-    --from-literal=judge-model="${JUDGE_MODEL:-qwen/qwen3.5-9b}" \
     --dry-run=client -o yaml | kubectl -n "$AGL_NAMESPACE" apply -f -
   kubectl -n "$AGL_NAMESPACE" create configmap swe-smith-oracle-scripts \
     --from-file="$EXAMPLE_DIR/hierarchical/oracle" \
     --dry-run=client -o yaml | kubectl -n "$AGL_NAMESPACE" apply -f -
+  printf '%s\n' "$settings" | kubectl -n "$AGL_NAMESPACE" create configmap swe-smith-settings \
+    --from-env-file=/dev/stdin --dry-run=client -o yaml | kubectl -n "$AGL_NAMESPACE" apply -f -
   echo "=== Starting Agent Lightning controller (runner_type=k8s) ==="
   echo "  Next: start the trainer on Machine B with './run.sh trainer'."
-  agl-controller \
+  run_logged agl-controller \
     runner_type=k8s \
     agl_server.url="$SERVER_URL" \
-    agl_server.key="$AGL_KEY" \
+    agl_server.agent_url="${AGL_SERVER_AGENT_URL:-$SERVER_URL}" \
+    "agl_server.key=\${oc.env:AGL_KEY}" \
+    hydra.job_logging.root.level=WARNING \
     k8s_runner.namespace="$AGL_NAMESPACE" \
-    k8s_runner.ttl_after_finished=600
+    k8s_runner.ttl_after_finished=600 \
+    "${hydra_logs[@]}"
 fi

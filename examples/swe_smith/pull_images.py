@@ -3,7 +3,7 @@
 
 """Prepare SWE-smith images for Kubernetes rollouts.
 
-The default job template runs ``{image_name}:oracle`` so the agent starts
+The default job template runs ``{image_name}:arbas`` so the agent starts
 without a runtime ``pip install``. This script prepares those local tags from
 the per-instance base images and only pulls a base image when it is missing
 from the active Docker daemon.
@@ -27,7 +27,7 @@ DEFAULT_DATASETS = (
     EXAMPLE_DIR / "train_dataset_mixed.jsonl",
     EXAMPLE_DIR / "val_dataset_filtered.jsonl",
 )
-OPENAI_IMAGE_SUFFIX = "oracle"
+ROLLOUT_IMAGE_TAG = "arbas"
 OPENAI_PACKAGE = "openai"
 
 
@@ -82,9 +82,9 @@ def openai_image_name(image_name: str) -> str:
     if tag is not None:
         raise ValueError(
             f"SWE-smith image_name must be untagged because job-template-openai.yaml "
-            f"uses '<image_name>:{OPENAI_IMAGE_SUFFIX}': {image_name}"
+            f"uses '<image_name>:{ROLLOUT_IMAGE_TAG}': {image_name}"
         )
-    return f"{image_name}:{OPENAI_IMAGE_SUFFIX}"
+    return f"{image_name}:{ROLLOUT_IMAGE_TAG}"
 
 
 def get_image(client: Any, image: str) -> Any | None:
@@ -156,7 +156,7 @@ def prepare_one(
         build_openai_image(client, source_image, target_image)
         return ImagePreparationResult(source_image, target_image, f"{source_status},{status}")
     except Exception as exc:
-        target = f"{source_image}:{OPENAI_IMAGE_SUFFIX}"
+        target = f"{source_image}:{ROLLOUT_IMAGE_TAG}"
         with contextlib.suppress(Exception):
             target = openai_image_name(source_image)
         return ImagePreparationResult(source_image, target, "failed", str(exc))
@@ -182,7 +182,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-build",
         action="store_true",
-        help="rebuild :oracle images even when the target tag already exists",
+        help=f"rebuild :{ROLLOUT_IMAGE_TAG} images even when the target tag already exists",
     )
     return parser.parse_args()
 
@@ -202,7 +202,7 @@ def main() -> None:
     for path in dataset_paths:
         print(f"  {path}")
     print(f"Instances: {len(dataset)} | distinct images: {len(images)}")
-    print("Preparing local :oracle images for job-template-openai.yaml")
+    print(f"Preparing local :{ROLLOUT_IMAGE_TAG} images for job-template-openai.yaml")
     for image in images:
         print(f"  {image} -> {openai_image_name(image)}")
 
@@ -230,7 +230,7 @@ def main() -> None:
     if failed:
         names = ", ".join(result.source_image for result in failed)
         raise SystemExit(f"Failed to prepare SWE-smith images: {names}")
-    print(f"Prepared {len(images)} SWE-smith :oracle images.")
+    print(f"Prepared {len(images)} SWE-smith :{ROLLOUT_IMAGE_TAG} images.")
 
 
 if __name__ == "__main__":

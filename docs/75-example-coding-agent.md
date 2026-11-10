@@ -19,12 +19,12 @@ On **Machine A (Kubernetes Controller machine)**, activate the project environme
 
 ```bash
 source .venv/bin/activate
-uv pip install -r examples/swe_smith/requirements.txt
+uv pip install docker
 ```
 
 Machine A also requires Docker, `kubectl`, and access to the Kubernetes cluster.
 
-On **Machine B (GPU training machine)**, install the project and GPU training environment described in the project installation guide. The SWE-smith image-preparation requirements above are not needed on Machine B.
+On **Machine B (GPU training machine)**, use the [training environment installer](../examples/swe_smith/hierarchical/README.md#первый-шаг-grpo).
 
 ## Data Preparation
 
@@ -62,7 +62,7 @@ python examples/swe_smith/pull_images.py \
     --dataset examples/swe_smith/val_dataset_filtered.jsonl
 ```
 
-This command installs the OpenAI client into each required SWE-smith base image and creates the `:openai` tags expected by `job-template-openai.yaml`. Run it again if the datasets introduce new repository images.
+This command installs the OpenAI SDK, Pydantic, and NumPy into each required SWE-smith base image and creates the `:arbas` tags expected by `job-template-openai.yaml`. Run it again if the datasets introduce new repository images.
 
 ## Training
 

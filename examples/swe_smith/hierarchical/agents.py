@@ -42,6 +42,7 @@ ORCHESTRATOR_TOOLS = [
     }
     for name, (schema, description) in ORCHESTRATOR_SCHEMAS.items()
 ]
+TOOL_RETRY = "Your tool call could not be read. Retry one tool call with its required arguments."
 
 
 def _query(client: OpenAI, settings: ModelSettings, result: TaskResult, tools: list[dict], gateway_wait: float = 0):
@@ -119,6 +120,8 @@ class SubAgent:
             message = choice.message
             if message.tool_calls:
                 observation = self._execute_tool_calls(result, message.tool_calls) or observation
+            elif choice.finish_reason == "tool_calls" or "<tool_call>" in (message.content or ""):
+                result.messages.append({"role": "user", "content": TOOL_RETRY})
             elif (message.content or "").strip():
                 result.status, result.summary = "completed", message.content
                 result.duration_s = time.perf_counter() - started
@@ -219,6 +222,8 @@ class Orchestrator:
             message = choice.message
             if message.tool_calls:
                 self._execute_tool_calls(result, message.tool_calls)
+            elif choice.finish_reason == "tool_calls" or "<tool_call>" in (message.content or ""):
+                result.messages.append({"role": "user", "content": TOOL_RETRY})
             elif (message.content or "").strip():
                 result.status, result.summary = "completed", message.content
                 result.duration_s = time.perf_counter() - started
@@ -248,7 +253,8 @@ class Orchestrator:
             spec = self.create_subagent(args.name)
             output = {"agent_name": spec.name, "profile": spec.profile}
         elif args.agent not in self.agents:
-            output = {"error": f"Unknown agent {args.agent!r}; create it first."}
+            available = ", ".join(self.agents) or "none yet"
+            output = {"error": f"Unknown agent {args.agent!r}. Use the exact agent_name. Available: {available}."}
         else:
             report = self.assign_task(args.agent, args.prompt, args.context)
             output = {

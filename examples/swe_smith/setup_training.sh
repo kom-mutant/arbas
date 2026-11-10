@@ -143,13 +143,15 @@ ninja==1.13.2
 numba==0.65.0
 numpy==2.3.5
 nvidia-cublas-cu12==12.9.1.4
+# CUDA 13 compiler and matching headers used by TileLang on Hopper.
+nvidia-cuda-cccl==13.2.86
 nvidia-cuda-cccl-cu12==12.9.27
-nvidia-cuda-crt==13.5.37
+nvidia-cuda-crt==13.2.86
 nvidia-cuda-cupti-cu12==12.9.79
 nvidia-cuda-nvcc==13.2.86
 nvidia-cuda-nvcc-cu12==12.9.86
 nvidia-cuda-nvrtc-cu12==12.9.86
-nvidia-cuda-runtime==13.5.37
+nvidia-cuda-runtime==13.2.86
 nvidia-cuda-runtime-cu12==12.9.79
 nvidia-cuda-tileiras==13.2.86
 nvidia-cudnn-cu12==9.17.1.4

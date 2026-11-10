@@ -19,7 +19,7 @@ install_training() {
 SHA256
   )
   tar -xzf "$build_dir/verl-0.8.0.tar.gz" -C "$build_dir"
-  patch -d "$build_dir/verl-0.8.0" -p1 < "$build_dir/verl-numpy2.patch"
+  patch -d "$build_dir/verl-0.8.0" -p1 < "$build_dir/verl.patch"
   uv build --quiet --python 3.12 --wheel --out-dir "$build_dir" "$build_dir/verl-0.8.0"
 
   uv venv --python 3.12 --allow-existing .venv
@@ -276,7 +276,7 @@ tzdata==2026.6
 urllib3==2.8.0
 uvicorn==0.54.0
 uvloop==0.23.0
-verl==0.8.0+arbas.1
+verl==0.8.0+arbas.2
 virtualenv==21.14.5
 vllm @ https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/vllm-0.24.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl
 wandb==0.31.0
@@ -308,7 +308,7 @@ requires-python = ">=3.9"
 requires-dist = ["torch ==2.11.*", "packaging", "ninja"]
 UV_CONFIG
 
-  cat > "$build_dir/verl-numpy2.patch" <<'VERL_PATCH'
+  cat > "$build_dir/verl.patch" <<'VERL_PATCH'
 --- a/setup.py
 +++ b/setup.py
 @@ -32 +32 @@
@@ -329,7 +329,32 @@ UV_CONFIG
 +++ b/verl/version/version
 @@ -1 +1 @@
 -0.8.0
-+0.8.0+arbas.1
++0.8.0+arbas.2
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout.py
+@@ -103,3 +103,2 @@
+-        # multiple replicas share a node, and the Ray job id so two independent
+-        # verl jobs on the same host (or a new run after a crashed one with a
+-        # stale socket file) cannot collide on the shared /tmp namespace.
++        # multiple replicas share a node. Independent Ray instances can reuse
++        # the same job id, so use the private directory from the launcher.
+@@ -108 +107,2 @@
+-        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
++        ipc_dir = os.environ.get("VERL_WEIGHT_TRANSFER_IPC_DIR", "/tmp")
++        self.zmq_handle = f"ipc://{ipc_dir}/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -294,4 +294,2 @@
+-        avoids collisions when multiple replicas share the same node, and is
+-        unique per Ray job to avoid cross-job collisions on shared hosts. The
+-        job id is forwarded by the vLLMHttpServer actor as VERL_RAY_JOB_ID and
+-        inherited by this vLLM worker subprocess.
++        and avoids collisions when multiple replicas share the same node. The
++        vLLMHttpServer actor forwards VERL_RAY_JOB_ID to this worker subprocess.
+@@ -301 +299,2 @@
+-        return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{self.local_rank}.sock"
++        ipc_dir = os.environ.get("VERL_WEIGHT_TRANSFER_IPC_DIR", "/tmp")
++        return f"ipc://{ipc_dir}/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{self.local_rank}.sock"
 VERL_PATCH
 }
 

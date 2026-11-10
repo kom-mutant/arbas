@@ -717,9 +717,11 @@ def test_prepare_ray_preserves_worker_defaults_and_checks_socket_path(monkeypatc
                           "ray_kwargs.ray_init.runtime_env.env_vars.TEST_VAR=present"]
     )
     monkeypatch.setenv("RAY_TMPDIR", "/tmp/agl-ray")
+    monkeypatch.setenv("VERL_WEIGHT_TRANSFER_IPC_DIR", "/tmp/agl-ipc-test")
     prepare_ray(config)
     assert dict(config.ray_kwargs.ray_init.runtime_env.env_vars) == {
         **defaults, "MAX_JOBS": "2", "TEST_VAR": "present",
+        "VERL_WEIGHT_TRANSFER_IPC_DIR": "/tmp/agl-ipc-test",
     }
 
     monkeypatch.setenv("RAY_TMPDIR", "/tmp/" + "long-" * 20)

@@ -11,6 +11,7 @@ import time
 from collections import defaultdict
 from contextlib import suppress
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 def stop_children(children: Path) -> None:
@@ -126,7 +127,9 @@ def check_smoke(path: str) -> None:
 def main() -> int:
     log_path, smoke_tmp, *trainer_args = sys.argv[1:]
     try:
-        status = run_trainer(trainer_args, log_path)
+        with TemporaryDirectory(prefix="agl-ipc-", dir="/tmp") as ipc_dir:
+            os.environ["VERL_WEIGHT_TRANSFER_IPC_DIR"] = ipc_dir
+            status = run_trainer(trainer_args, log_path)
         if status == 0 and smoke_tmp:
             check_smoke(os.environ["TENSORBOARD_DIR"])
         return status

@@ -140,8 +140,11 @@ def prepare_ray(config: DictConfig) -> None:
     env_path = "ray_kwargs.ray_init.runtime_env.env_vars"
     defaults = get_ppo_ray_runtime_env()["env_vars"]
     overrides = OmegaConf.select(config, env_path) or {}
+    worker_env = {"MAX_JOBS": "2"}
+    if ipc_dir := os.environ.get("VERL_WEIGHT_TRANSFER_IPC_DIR"):
+        worker_env["VERL_WEIGHT_TRANSFER_IPC_DIR"] = ipc_dir
     # Agent Lightning replaces the whole env_vars map if the config supplies one.
-    env_vars = OmegaConf.merge(defaults, overrides, {"MAX_JOBS": "2"})
+    env_vars = OmegaConf.merge(defaults, overrides, worker_env)
     OmegaConf.update(config, env_path, env_vars)
 
 

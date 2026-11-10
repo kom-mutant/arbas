@@ -43,6 +43,7 @@ actor_rollout_ref:
       vllm:
         enable_auto_tool_choice: true
         moe_backend: triton
+        gdn_prefill_backend: triton
     temperature: 1
     val_kwargs:
       temperature: 0.7
@@ -95,6 +96,10 @@ agentlightning:
     enabled: false
     async_train_batch_size: 50
 
+ray_kwargs:
+  ray_init:
+    address: local
+
 agents:
   SMITH_MAX_TURNS: 100
   SUBAGENT_MAX_STEPS: 20
@@ -117,7 +122,7 @@ agents:
   JUDGE_MODEL: qwen/qwen3.5-9b
   JUDGE_MAX_TOKENS: 1024
 
-# Overrides for run.sh controller --smoke and run.sh trainer --smoke.
+# Overrides for run.sh <role> --smoke.
 smoke:
   agents:
     SMITH_MAX_TURNS: 12
@@ -133,12 +138,22 @@ smoke:
     max_prompt_length: 8192
     max_response_length: 8192
   actor_rollout_ref:
+    model:
+      path: Qwen/Qwen3.5-2B
+      lora_rank: 16
     actor:
       ppo_mini_batch_size: 1
     rollout:
       n: 4
       max_model_len: 16384
-      gpu_memory_utilization: 0.7
+      gpu_memory_utilization: 0.45
+      enforce_eager: true
+  reward:
+    num_workers: 2
+  ray_kwargs:
+    ray_init:
+      num_cpus: 8
+      object_store_memory: 4294967296  # 4 GiB
   trainer:
     n_gpus_per_node: 1
     val_before_train: false

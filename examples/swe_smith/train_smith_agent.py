@@ -5,6 +5,7 @@ import argparse
 import importlib.resources
 import json
 import os
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -109,7 +110,39 @@ def build_config(
     OmegaConf.set_struct(base_cfg, False)
     config = OmegaConf.merge(base_cfg, overrides, cli_override_conf)
     OmegaConf.set_struct(config, False)
+    rollout = config.actor_rollout_ref.rollout
+    if smoke and rollout.name != "vllm":
+        raise ValueError("Smoke requires vLLM.")
+    if rollout.name == "vllm" and (smoke or uses_qwen35):
+        if OmegaConf.select(rollout, "engine_kwargs.vllm.gdn_prefill_backend") != "triton":
+            raise ValueError("This vLLM profile requires gdn_prefill_backend=triton.")
+    if OmegaConf.select(config, "ray_kwargs.ray_init.address") != "local":
+        raise ValueError("Training requires its own local Ray instance.")
+    max_jobs = OmegaConf.select(config, "ray_kwargs.ray_init.runtime_env.env_vars.MAX_JOBS")
+    if max_jobs not in (None, 2, "2"):
+        raise ValueError("Training requires MAX_JOBS=2 in the Ray worker environment.")
     return config
+
+
+def prepare_ray(config: DictConfig) -> None:
+    from ray._private.utils import validate_socket_filepath
+    from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
+
+    ray_tmpdir = os.environ.get("RAY_TMPDIR")
+    if ray_tmpdir:
+        session_dir = f"session_2000-01-01_00-00-00_000000_{os.getpid()}"
+        socket_path = Path(ray_tmpdir).absolute() / session_dir / "sockets" / "plasma_store"
+        try:
+            validate_socket_filepath(str(socket_path))
+        except OSError as exc:
+            raise RuntimeError("Ray socket path is too long. Use a shorter AGL_SMOKE_TMPDIR or RAY_TMPDIR.") from exc
+
+    env_path = "ray_kwargs.ray_init.runtime_env.env_vars"
+    defaults = get_ppo_ray_runtime_env()["env_vars"]
+    overrides = OmegaConf.select(config, env_path) or {}
+    # Agent Lightning replaces the whole env_vars map if the config supplies one.
+    env_vars = OmegaConf.merge(defaults, overrides, {"MAX_JOBS": "2"})
+    OmegaConf.update(config, env_path, env_vars)
 
 
 def train(
@@ -119,6 +152,8 @@ def train(
     val_dataset_path: str | None = None,
     max_val_instances: int | None = None,
 ) -> None:
+    import ray
+
     from agentlightning.verl.entrypoint import run_ppo
 
     if not config.agentlightning.agl_key:
@@ -139,9 +174,22 @@ def train(
     log(f"  val file:     {val_dataset_path}")
     log(f"  instances:    {len(instances)}  (train {len(train_dataset)} / val {len(val_dataset)})")
     log(f"  distinct repos (images to prepare): {len(distinct_repos)}")
+    log(f"  GDN prefill:  {OmegaConf.select(config, 'actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend')}")
+    log(f"  MAX_JOBS:     {os.environ.get('MAX_JOBS', 'unset')}")
 
     log("\n=== Start VERL training ===")
-    run_ppo(config=config, train_dataset=train_dataset, val_dataset=val_dataset)
+    ray_was_initialized = ray.is_initialized()
+    if not ray_was_initialized:
+        prepare_ray(config)
+    started = time.perf_counter()
+    completed = False
+    try:
+        run_ppo(config=config, train_dataset=train_dataset, val_dataset=val_dataset)
+        completed = True
+    finally:
+        log(f"VERL finished: completed={completed} trainer_wall_s={time.perf_counter() - started:.2f}")
+        if not ray_was_initialized:
+            ray.shutdown(wait_for_processes=True)
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -176,6 +224,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     args, config_overrides = parse_args()
+    os.environ["MAX_JOBS"] = "2"
     config = build_config(
         config_path=args.config,
         smoke=args.smoke,

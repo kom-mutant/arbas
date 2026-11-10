@@ -231,7 +231,7 @@ def post_event(event_type: str, data: dict[str, Any], retry: bool = False) -> No
             with urllib.request.urlopen(request, timeout=15) as response:
                 response.read()
             return
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
             fatal_http = isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500 and exc.code != 429
             if fatal_http or attempt == attempts:
                 log.warning("failed to post %s event: %s", event_type, exc)

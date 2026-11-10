@@ -1,3 +1,4 @@
+import http.client
 import json
 import subprocess
 import time
@@ -263,20 +264,23 @@ def test_shell_timeout_stops_background_children_and_hides_keys(config, monkeypa
     assert not (Path(smith.TESTBED) / "orphan").exists()
 
 
-@pytest.mark.parametrize("fatal", [True, False])
-def test_reward_retries_are_finite(fatal):
-    error = (
-        urllib.error.HTTPError("https://events.invalid", 401, "Unauthorized", {}, None)
-        if fatal
-        else urllib.error.URLError("offline")
-    )
+@pytest.mark.parametrize(
+    ("error", "attempts"),
+    [
+        (urllib.error.HTTPError("https://events.invalid", 401, "Unauthorized", {}, None), 1),
+        (urllib.error.URLError("offline"), 4),
+        (http.client.RemoteDisconnected("connection closed"), 4),
+        (ConnectionResetError("connection reset"), 4),
+    ],
+)
+def test_reward_retries_are_finite(error, attempts):
     with (
         patch.dict("os.environ", {"AGL_EVENT_URL": "https://events.invalid"}),
         patch.object(smith.urllib.request, "urlopen", side_effect=error) as send,
         patch.object(smith.time, "sleep"),
     ):
         smith.post_event("reward", {"value": 0}, retry=True)
-    assert send.call_count == (1 if fatal else 4)
+    assert send.call_count == attempts
 
 
 @pytest.mark.parametrize(
@@ -368,6 +372,8 @@ def test_main_with_real_sdk_prepares_fixes_grades_and_publishes(
     saved_text = (tmp_path / "results/fixture-instance.json").read_text()
     saved = json.loads(saved_text)
     assert saved["reward"] == int(fixes_bug)
+    assert saved["timings_s"]["rollout_wall"] >= saved["timings_s"]["evaluation"] >= 0
+    assert (saved["timings_s"]["judge"] is not None) == semantic
     if fixes_bug:
         assert "helper.py" in saved["patch"]
     else:
@@ -657,22 +663,65 @@ def test_training_parser_follows_effective_model(tmp_path):
     assert other.actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser == "hermes"
 
 
-def test_training_smoke_keeps_lora_settings(tmp_path):
+def test_training_smoke_settings(tmp_path):
     pytest.importorskip("verl")
     from omegaconf import OmegaConf
 
     from examples.swe_smith.train_smith_agent import DEFAULT_CONFIG, build_config
 
     settings = OmegaConf.load(DEFAULT_CONFIG)
-    settings.actor_rollout_ref.model.lora_rank = 16
     config_path = tmp_path / "experiment.yaml"
     OmegaConf.save(settings, config_path)
     config = build_config(config_path=config_path, smoke=True)
+    full = build_config(config_path=config_path)
 
+    assert config.actor_rollout_ref.model.path == "Qwen/Qwen3.5-2B"
     assert config.actor_rollout_ref.model.lora_rank == 16
     assert config.actor_rollout_ref.model.lora.merge is True
     assert config.actor_rollout_ref.rollout.n == 4
+    assert config.actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend == "triton"
+    assert config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.45
+    assert config.reward.num_workers == 2
+    assert config.ray_kwargs.ray_init.address == "local"
+    assert config.ray_kwargs.ray_init.num_cpus == 8
+    assert config.ray_kwargs.ray_init.object_store_memory == 4 * 1024**3
+    assert full.actor_rollout_ref.model.path == "Qwen/Qwen3.5-9B"
+    assert full.actor_rollout_ref.model.lora_rank == 0
+    assert full.actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend == "triton"
+    assert full.ray_kwargs.ray_init.address == "local"
+    assert full.ray_kwargs.ray_init.get("num_cpus") is None
+    assert full.ray_kwargs.ray_init.get("object_store_memory") is None
     assert config.trainer.total_training_steps == 1
+    assert config.trainer.logger == ["console", "tensorboard"]
+    assert full.trainer.logger == ["console", "tensorboard"]
     assert config.data.train_files == str(tmp_path / "smoke_train.jsonl")
     assert config.agentlightning.trace_aggregator.trajectory_max_response_length == config.data.max_response_length
     assert "agents" not in config
+    with pytest.raises(ValueError, match="gdn_prefill_backend=triton"):
+        build_config(config_overrides=["actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend=flashinfer"])
+    with pytest.raises(ValueError, match="local Ray"):
+        build_config(smoke=True, config_overrides=["ray_kwargs.ray_init.address=auto"])
+    with pytest.raises(ValueError, match="MAX_JOBS=2"):
+        build_config(config_overrides=["ray_kwargs.ray_init.runtime_env.env_vars.MAX_JOBS=47"])
+
+
+def test_prepare_ray_preserves_worker_defaults_and_checks_socket_path(monkeypatch):
+    pytest.importorskip("verl")
+    pytest.importorskip("ray")
+    from examples.swe_smith.train_smith_agent import build_config, prepare_ray
+
+    defaults = {"VLLM_DISABLE_COMPILE_CACHE": "1", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"}
+    monkeypatch.setattr("verl.trainer.constants_ppo.get_ppo_ray_runtime_env", lambda: {"env_vars": defaults})
+    config = build_config(
+        config_overrides=["ray_kwargs.ray_init.runtime_env.env_vars.MAX_JOBS=2",
+                          "ray_kwargs.ray_init.runtime_env.env_vars.TEST_VAR=present"]
+    )
+    monkeypatch.setenv("RAY_TMPDIR", "/tmp/agl-ray")
+    prepare_ray(config)
+    assert dict(config.ray_kwargs.ray_init.runtime_env.env_vars) == {
+        **defaults, "MAX_JOBS": "2", "TEST_VAR": "present",
+    }
+
+    monkeypatch.setenv("RAY_TMPDIR", "/tmp/" + "long-" * 20)
+    with pytest.raises(RuntimeError, match="Ray socket path is too long"):
+        prepare_ray(config)

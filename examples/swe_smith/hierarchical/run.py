@@ -147,6 +147,7 @@ def main() -> int:
     log.info("SmithAgent start: instance=%s max_turns=%d", instance_id, max_turns)
     smith.checkout_bug_commit(instance_id)
     smith.relocate_git()
+    solve_started = time.perf_counter()
     with (
         OpenAI(
             base_url=config.orchestrator_base_url, api_key=config.orchestrator_api_key, timeout=config.api_timeout, max_retries=3
@@ -159,6 +160,7 @@ def main() -> int:
         ) as subagent_client,
     ):
         swarm = Orchestrator(config, client, subagent_client, router=router).run(problem)
+    solve_wall_s = time.perf_counter() - solve_started
 
     submitted = swarm.orchestrator.status == "completed"
     n_turns = swarm.orchestrator.steps_taken
@@ -166,16 +168,22 @@ def main() -> int:
 
     patch = smith.capture_patch()
     scores = []
+    judge_wall_s = None
+    judged_assignments = 0
     if judge_address is not None and swarm.assignments:
         judge_started = time.perf_counter()
         scores = judge_assignments(problem, swarm.assignments, config, judge_address)
+        judge_wall_s = time.perf_counter() - judge_started
+        judged_assignments = sum(score is not None for score in scores)
         log.info(
             "Judge stage: assignments=%d scored=%d wall_s=%.2f",
             len(scores),
-            sum(score is not None for score in scores),
-            time.perf_counter() - judge_started,
+            judged_assignments,
+            judge_wall_s,
         )
+    evaluation_started = time.perf_counter()
     raw_reward, resolved, reason, timed_out = smith.evaluate(eval_meta, eval_timeout, f2p_only=f2p_only)
+    evaluation_wall_s = time.perf_counter() - evaluation_started
 
     reward = training_reward(raw_reward, resolved, swarm.orchestrator, config)
 
@@ -216,20 +224,39 @@ def main() -> int:
     output_dir = Path(os.environ.get("HIER_OUTPUT_DIR", "/tmp/hierarchical-smith"))
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / (instance_id.replace("/", "__") + ".json")
-    output = {
+    timings = {
+        "setup": solve_started - started,
+        "solve": solve_wall_s,
+        "judge": judge_wall_s,
+        "evaluation": evaluation_wall_s,
+        "rollout_wall": time.perf_counter() - started,
+    }
+    episode_metrics = {
+        "job_name": os.environ.get("AGL_ROLLOUT_JOB_NAME"),
         "instance_id": instance_id,
-        "patch": patch,
         "reward": reward,
         "raw_reward": raw_reward,
         "resolved": resolved,
+        "submitted": submitted,
         "reason": reason,
+        "eval_timeout": timed_out,
+        "turns": n_turns,
+        "max_prompt_tokens": max_prompt_tokens,
+        "assignment_count": len(swarm.assignments),
+        "judged_assignments": judged_assignments,
+        "timings_s": timings,
+    }
+    output = {
+        **episode_metrics,
+        "patch": patch,
         "config": config.model_dump(exclude={"orchestrator_api_key", "subagent_api_key", "judge_api_key"}),
         **swarm.model_dump(mode="json"),
     }
     if router is not None:
         output["oracle"] = router.report()
     output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
-    log.info("saved episode: %s (rollout_wall_s=%.2f)", output_path, time.perf_counter() - started)
+    log.info("saved episode: %s (rollout_wall_s=%.2f)", output_path, timings["rollout_wall"])
+    log.info("episode_metrics=%s", json.dumps(episode_metrics, ensure_ascii=False))
     return 0
 
 

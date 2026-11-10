@@ -3,7 +3,7 @@
 set -euo pipefail
 ROLE="${1:-}"
 if [ "$ROLE" != "server" ] && [ "$ROLE" != "controller" ] && [ "$ROLE" != "trainer" ]; then
-  echo "Usage: $0 {server|controller|trainer} [--smoke for controller and trainer]"
+  echo "Usage: $0 {server|controller|trainer} [--smoke]"
   echo "  server      → Machine B: agl-server (store + API only, no model backend)"
   echo "  controller  → Machine A: agent ConfigMap + agl-controller (k8s runner)"
   echo "  trainer     → Machine B: VERL trainer (enqueues rollouts)"
@@ -12,6 +12,13 @@ if [ "$ROLE" != "server" ] && [ "$ROLE" != "controller" ] && [ "$ROLE" != "train
   exit 1
 fi
 shift || true
+smoke=false
+for arg in "$@"; do
+  if [ "$arg" = "--smoke" ]; then
+    smoke=true
+    break
+  fi
+done
 cd "$(dirname "$0")/../.."
 EXAMPLE_DIR="examples/swe_smith"
 AGL_SERVER_PORT="${AGL_SERVER_PORT:-8080}"
@@ -22,16 +29,20 @@ DEFAULT_TRAIN_SCRIPT="$EXAMPLE_DIR/train_smith_agent.py"
 AGL_TRAIN_SCRIPT="${AGL_TRAIN_SCRIPT:-$DEFAULT_TRAIN_SCRIPT}"
 AGL_INCLUDE_ROUTED_EXPERTS="${AGL_INCLUDE_ROUTED_EXPERTS:-false}"
 AGL_NAMESPACE="${AGL_NAMESPACE:-default}"
-PUBLIC_HOST="${AGL_SERVER_PUBLIC_HOST:-0.0.0.0}"
+default_host=0.0.0.0
+if [ "$smoke" = true ]; then
+  default_host=127.0.0.1
+fi
+PUBLIC_HOST="${AGL_SERVER_PUBLIC_HOST:-$default_host}"
 SERVER_URL="http://${PUBLIC_HOST}:${AGL_SERVER_PORT}"
 export VLLM_USE_FLASHINFER_MOE_FP16="${VLLM_USE_FLASHINFER_MOE_FP16:-0}"
 
 umask 077
-run_dir="${AGL_RUN_DIR:-$PWD/outputs/swe-smith}"
+run_dir="${AGL_RUN_DIR:-$PWD/outputs/swe-smith${AGL_RUN_NAME:+/$AGL_RUN_NAME}}"
 mkdir -p "$run_dir"
 run_dir="$(cd "$run_dir" && pwd)"
-export AGL_KEY TENSORBOARD_DIR="${TENSORBOARD_DIR:-$run_dir/tensorboard}"
-hydra_logs=("hydra.run.dir=$run_dir" hydra.output_subdir=null 'hydra.job_logging.root.handlers=[console]')
+export AGL_KEY AGL_RUN_DIR="$run_dir" TENSORBOARD_DIR="${TENSORBOARD_DIR:-$run_dir/tensorboard}"
+hydra_logs=("hydra.run.dir=\${oc.env:AGL_RUN_DIR}" hydra.output_subdir=null 'hydra.job_logging.root.handlers=[console]')
 echo "Log: $run_dir/$ROLE.log"
 
 run_logged() {
@@ -40,12 +51,7 @@ import os
 import sys
 
 key = os.environ["AGL_KEY"]
-last_progress = None
 for line in sys.stdin:
-    if "AglRolloutManager: completed=" in line:
-        if line == last_progress:
-            continue
-        last_progress = line
     sys.stdout.write(line.replace(key, "[redacted]"))
 ' | tee -a "$run_dir/$ROLE.log"
 }
@@ -55,8 +61,12 @@ if [ "$ROLE" = "server" ]; then
     AGL_MODEL_NAME="$(python -c '
 import sys
 from omegaconf import OmegaConf
-print(OmegaConf.load(sys.argv[1]).actor_rollout_ref.model.path)
-' "$AGL_TRAIN_CONFIG")"
+
+config = OmegaConf.load(sys.argv[1])
+if sys.argv[2] == "true":
+    config = OmegaConf.merge(config, config.smoke)
+print(config.actor_rollout_ref.model.path)
+' "$AGL_TRAIN_CONFIG" "$smoke")"
   fi
   echo "=== SWE-smith :: server (Machine B) ==="
   echo "  Public server URL: $SERVER_URL"
@@ -65,7 +75,7 @@ print(OmegaConf.load(sys.argv[1]).actor_rollout_ref.model.path)
   echo "=== Starting Agent Lightning server (no model backend) ==="
   run_logged agl-server \
     port="$AGL_SERVER_PORT" \
-    host="${AGL_SERVER_BIND:-0.0.0.0}" \
+    host="${AGL_SERVER_BIND:-$default_host}" \
     "key=\${oc.env:AGL_KEY}" \
     default_proxy.model_name="$AGL_MODEL_NAME" \
     default_proxy.include_routed_experts="$AGL_INCLUDE_ROUTED_EXPERTS" \
@@ -77,6 +87,28 @@ elif [ "$ROLE" = "trainer" ]; then
     echo "ERROR: server not reachable at http://localhost:$AGL_SERVER_PORT — start './run.sh server' first."
     exit 1
   fi
+  if [ "$smoke" = true ]; then
+    if [ "$AGL_TRAIN_SCRIPT" != "$DEFAULT_TRAIN_SCRIPT" ]; then
+      echo "ERROR: smoke requires the standard trainer. Unset AGL_TRAIN_SCRIPT."
+      exit 1
+    fi
+    scratch_parent="${AGL_SMOKE_TMPDIR:-/tmp}"
+    if [ ! -d "$scratch_parent" ]; then
+      echo "ERROR: AGL_SMOKE_TMPDIR must point to an existing directory: $scratch_parent" >&2
+      exit 1
+    fi
+    if ! df -Pk "$scratch_parent" | awk 'NR == 2 { ok = $4 >= 16 * 1024 * 1024 && ($5 + 0) < 95 } END { exit !ok }'; then
+      echo "ERROR: smoke needs a scratch filesystem with at least 16 GiB available and less than 95% usage. Set AGL_SMOKE_TMPDIR."
+      exit 1
+    fi
+    smoke_tmp="$(mktemp -d "$scratch_parent/agl-smoke.XXXXXXXX")"
+    trap 'rm -rf -- "$smoke_tmp"' EXIT
+    export TMPDIR="$smoke_tmp" RAY_TMPDIR="$smoke_tmp"
+    echo "  Scratch: $smoke_tmp"
+    mkdir -p "$TENSORBOARD_DIR"
+    TENSORBOARD_DIR="$(mktemp -d "$TENSORBOARD_DIR/smoke.XXXXXXXX")"
+  fi
+  export MAX_JOBS=2
   echo "=== Running SWE-smith training ==="
   if [ "$AGL_TRAIN_SCRIPT" != "$DEFAULT_TRAIN_SCRIPT" ]; then
     set -- --agl-key "$AGL_KEY" \
@@ -85,10 +117,18 @@ elif [ "$ROLE" = "trainer" ]; then
       --model "${AGL_MODEL_NAME:-Qwen/Qwen3.5-9B}" \
       --run-name "${AGL_RUN_NAME:-distributed}" "$@"
   fi
-  run_logged python -u "$AGL_TRAIN_SCRIPT" \
+  exec python -u "$EXAMPLE_DIR/launch_trainer.py" "$run_dir/trainer.log" "${smoke_tmp:-}" "$AGL_TRAIN_SCRIPT" \
     --agl-base-url "http://localhost:$AGL_SERVER_PORT" \
     "$@"
 elif [ "$ROLE" = "controller" ]; then
+  if [ -z "${AGL_SERVER_AGENT_URL:-}" ] && [[ "$PUBLIC_HOST" = localhost || "$PUBLIC_HOST" = 127.* ]]; then
+    echo "ERROR: set AGL_SERVER_AGENT_URL to an address reachable from the Kubernetes pods." >&2
+    exit 1
+  fi
+  job_ttl=600
+  if [ "$smoke" = true ]; then
+    job_ttl=3600
+  fi
   settings="$(python -c '
 import json
 import os
@@ -97,16 +137,20 @@ from omegaconf import OmegaConf
 
 config = OmegaConf.load(sys.argv[1])
 agents = config.agents
-if sys.argv[2:] == ["--smoke"]:
+if sys.argv[2] == "true":
     agents = OmegaConf.merge(agents, config.smoke.agents)
 for key, value in OmegaConf.to_container(agents, resolve=True).items():
     default = value if isinstance(value, str) else json.dumps(value)
     print(f"{key}={os.environ.get(key, default)}")
-' "$AGL_TRAIN_CONFIG" "$@")"
+' "$AGL_TRAIN_CONFIG" "$smoke")"
   echo "=== SWE-smith :: controller (Machine A) ==="
   echo "  Connecting to server: $SERVER_URL"
   echo "  Namespace: $AGL_NAMESPACE"
   if ! curl -fsS --max-time 5 "${SERVER_URL}/healthz" >/dev/null 2>&1; then
+    if [ "$smoke" = true ]; then
+      echo "ERROR: server not reachable at $SERVER_URL — check the server and SSH tunnel first."
+      exit 1
+    fi
     echo "WARNING: server not reachable at $SERVER_URL — start './run.sh server' on Machine B first."
   fi
   echo "=== Ensuring namespace '$AGL_NAMESPACE' exists ==="
@@ -129,6 +173,6 @@ for key, value in OmegaConf.to_container(agents, resolve=True).items():
     "agl_server.key=\${oc.env:AGL_KEY}" \
     hydra.job_logging.root.level=WARNING \
     k8s_runner.namespace="$AGL_NAMESPACE" \
-    k8s_runner.ttl_after_finished=600 \
+    k8s_runner.ttl_after_finished="$job_ttl" \
     "${hydra_logs[@]}"
 fi

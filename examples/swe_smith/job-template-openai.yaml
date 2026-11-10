@@ -23,6 +23,8 @@ spec:
           env:
             - name: AGL_TASK_INPUT
               value: {{ input.problem_statement | yaml_escape }}
+            - name: AGL_ROLLOUT_JOB_NAME
+              value: {{ job_name | yaml_escape }}
             - name: HIER_OUTPUT_DIR
               value: "/agl-logs/new/{{ job_name }}"
             - name: OPENROUTER_API_KEY

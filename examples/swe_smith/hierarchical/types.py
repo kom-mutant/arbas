@@ -38,10 +38,13 @@ class TokenUsage(BaseModel):
 
     def add(self, usage: Any) -> None:
         if usage is not None:
-            self.prompt_tokens += usage.prompt_tokens
-            self.completion_tokens += usage.completion_tokens
-            self.total_tokens += usage.total_tokens
-            self.max_prompt_tokens = max(self.max_prompt_tokens, usage.prompt_tokens)
+            prompt = usage.prompt_tokens or 0
+            completion = usage.completion_tokens or 0
+            total = usage.total_tokens or (prompt + completion)
+            self.prompt_tokens += prompt
+            self.completion_tokens += completion
+            self.total_tokens += total
+            self.max_prompt_tokens = max(self.max_prompt_tokens, prompt)
 
 
 class Judgment(BaseModel):

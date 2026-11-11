@@ -237,6 +237,7 @@ def test_forbidden_action_allows_legit_commands(monkeypatch) -> None:
         "cat .gitignore",
         "grep -rn 'legit digital' src/",
         "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+        'python3 -c "\n# Test (HTTP default)\nprint(1)\n"',
     ):
         assert fa(cmd) is None, cmd
 
@@ -254,6 +255,7 @@ def test_forbidden_action_blocks_network_install_and_tamper(monkeypatch) -> None
         "conda install numpy",
         "curl -sL https://raw.githubusercontent.com/x/y/main/z.py -o /testbed/z.py",
         "wget http://example.com/patch.py",
+        "http https://example.com/patch.py",
         'python -c "import urllib.request; urllib.request.urlopen(u)"',
         "echo 'x' > /testbed/conftest.py",
         "tee /testbed/pytest.ini",

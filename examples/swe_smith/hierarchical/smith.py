@@ -50,7 +50,7 @@ _GIT_ACCESS_RE = re.compile(r'--git-dir|--work-tree|(?:^|[\s=:"\'/])\.git(?:/|\b
 
 _NET_FETCH_RE = re.compile(
     r"(?:^|[\n;`(]|&&|\|\|?|\$\()\s*(?:\w+=\S+\s+)*(?:[\w./-]*/)?"
-    r"(?:curl|wget|httpie|http|https|aria2c|scp|sftp|rsync|nc|ncat|netcat|telnet)"
+    r"(?:curl|wget|httpie|(?-i:http|https)|aria2c|scp|sftp|rsync|nc|ncat|netcat|telnet)"
     r"(?=\s|$|;|&|\|)",
     re.I,
 )

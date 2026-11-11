@@ -659,8 +659,73 @@ def test_training_parser_follows_effective_model(tmp_path):
     other = build_config(config_overrides=[override + "Qwen/Qwen3-8B"])
 
     assert local.actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser == "qwen3_coder"
-    assert "chat_template" not in local.actor_rollout_ref.rollout.engine_kwargs.vllm
+    assert Path(local.actor_rollout_ref.rollout.engine_kwargs.vllm.chat_template).name == "qwen35_chat_template.jinja"
     assert other.actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser == "hermes"
+
+
+def test_qwen35_chat_template_is_prefix_preserving():
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    env = ImmutableSandboxedEnvironment(trim_blocks=False, lstrip_blocks=False)
+    env.filters["tojson"] = lambda x: json.dumps(x, ensure_ascii=False)
+    env.filters["items"] = lambda d: list(d.items())
+    env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
+    template_path = Path(__file__).resolve().parents[2] / "examples/swe_smith/qwen35_chat_template.jinja"
+    tmpl = env.from_string(template_path.read_text(encoding="utf-8"))
+    tools = [{"type": "function", "function": {"name": "create_subagent", "parameters": {"type": "object"}}}]
+
+    msgs = [
+        {"role": "system", "content": "Sys"},
+        {"role": "user", "content": "Issue"},
+        {
+            "role": "assistant",
+            "reasoning_content": "First step\n\n",
+            "content": None,
+            "tool_calls": [{"function": {"name": "create_subagent", "arguments": {"name": "research"}}}],
+        },
+        {"role": "tool", "content": '{"agent_name": "research_1"}'},
+        {
+            "role": "assistant",
+            "reasoning": None,
+            "content": None,
+            "tool_calls": [{"function": {"name": "create_subagent", "arguments": {"name": "fix"}}}],
+        },
+        {"role": "tool", "content": '{"agent_name": "fix_2"}'},
+        {"role": "user", "content": "Retry one tool call."},
+        {"role": "assistant", "reasoning_content": "Final\n", "content": "Done\n"},
+    ]
+
+    p0 = tmpl.render(messages=msgs[:2], tools=tools, add_generation_prompt=True)
+    ctx0 = (
+        p0
+        + "First step\n\n</think>\n\n<tool_call>\n<function=create_subagent>\n"
+        + "<parameter=name>\nresearch\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+    )
+    p1 = tmpl.render(messages=msgs[:4], tools=tools, add_generation_prompt=True)
+    assert p1.startswith(ctx0)
+    ctx1 = (
+        p1
+        + "</think>\n\n<tool_call>\n<function=create_subagent>\n"
+        + "<parameter=name>\nfix\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+    )
+    p2 = tmpl.render(messages=msgs[:7], tools=tools, add_generation_prompt=True)
+    assert p2.startswith(ctx1)
+    p3 = tmpl.render(messages=msgs, tools=tools, add_generation_prompt=False)
+    assert p3.startswith(p2)
+    assert "<think>\nFirst step\n\n</think>" in p3
+
+    no_think_p0 = tmpl.render(messages=msgs[:2], tools=tools, add_generation_prompt=True, enable_thinking=False)
+    no_think_p1 = tmpl.render(messages=msgs[:4], tools=tools, add_generation_prompt=True, enable_thinking=False)
+    assert no_think_p0.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    assert no_think_p1.startswith(no_think_p0)
+
+
+def test_http_comment_allowed_and_usage_handles_none():
+    assert smith._forbidden_action('python3 -c "\n# Test (HTTP default)\nprint(1)\n"') is None
+    assert smith._forbidden_action("http https://example.com/file.py") is not None
+    usage = TokenUsage()
+    usage.add(SimpleNamespace(prompt_tokens=None, completion_tokens=7, total_tokens=None))
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, usage.max_prompt_tokens) == (0, 7, 7, 0)
 
 
 def test_training_smoke_settings(tmp_path):

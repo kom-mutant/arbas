@@ -54,7 +54,7 @@ _GIT_ACCESS_RE = re.compile(r'--git-dir|--work-tree|(?:^|[\s=:"\'/])\.git(?:/|\b
 # anchoring as _GIT_INVOKE_RE. Code-level backstop for the egress NetworkPolicy.
 _NET_FETCH_RE = re.compile(
     r"(?:^|[\n;`(]|&&|\|\|?|\$\()\s*(?:\w+=\S+\s+)*(?:[\w./-]*/)?"
-    r"(?:curl|wget|httpie|http|https|aria2c|scp|sftp|rsync|nc|ncat|netcat|telnet)"
+    r"(?:curl|wget|httpie|(?-i:http|https)|aria2c|scp|sftp|rsync|nc|ncat|netcat|telnet)"
     r"(?=\s|$|;|&|\|)",
     re.I,
 )

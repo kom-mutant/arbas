@@ -97,7 +97,11 @@ def build_config(
     uses_qwen35 = model_type in {"qwen3_5", "qwen3_5_moe"} if model_type else "qwen3.5" in model_path.lower()
     engine = overrides.actor_rollout_ref.rollout.engine_kwargs
     if uses_qwen35:
-        defaults = {"tool_call_parser": "qwen3_coder", "reasoning_parser": "qwen3"}
+        defaults = {
+            "tool_call_parser": "qwen3_coder",
+            "reasoning_parser": "qwen3",
+            "chat_template": str(EXAMPLE_DIR / "qwen35_chat_template.jinja"),
+        }
     else:
         defaults = {"tool_call_parser": "hermes", "chat_template": str(EXAMPLE_DIR / "swe_smith_chat_template.jinja")}
     engine.vllm = OmegaConf.merge(defaults, engine.vllm)

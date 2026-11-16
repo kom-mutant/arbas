@@ -13,6 +13,13 @@ from typing import Any
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
+if __package__:
+    from .pull_images import select_distinct_instances
+    from .training_config import load_training_config
+else:
+    from pull_images import select_distinct_instances
+    from training_config import load_training_config
+
 EXAMPLE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = EXAMPLE_DIR / "training.yaml"
 DATA_SOURCE = "swe_smith"
@@ -32,8 +39,9 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
-def _project(instance: dict[str, Any]) -> dict[str, Any]:
+def _project(instance: dict[str, Any], agent_settings: dict[str, str]) -> dict[str, Any]:
     row = {field: instance.get(field) for field in INSTANCE_FIELDS}
+    row["arbas_agent_settings"] = agent_settings
     row["data_source"] = DATA_SOURCE
     row["data_id"] = str(instance.get("instance_id", ""))
     return row
@@ -43,16 +51,26 @@ def load_split_file(
     path: str,
     *,
     max_instances: int | None = None,
+    agent_settings: dict[str, str],
 ) -> list[dict[str, Any]]:
     """Load a pre-split, pre-curated JSONL dataset and project to the VERL schema."""
     with Path(path).open() as file:
         rows = [json.loads(line) for line in file if line.strip()]
-    selected = [_project(row) for row in rows]
+    selected = [_project(row, agent_settings) for row in rows]
     if max_instances:
         selected = selected[:max_instances]
     if not selected:
         raise ValueError(f"No instances loaded from {path}")
     return selected
+
+
+def load_agent_settings(config_path: Path, run_name: str) -> dict[str, str]:
+    experiment = load_training_config(config_path)
+    settings = OmegaConf.to_container(experiment.agents, resolve=True)
+    settings["AGL_RUN_NAME"] = run_name
+    if settings["ORACLE_CHECKPOINT"] == "auto":
+        settings["ORACLE_CHECKPOINT"] = f"/agl-logs/{run_name}/oracle/linucb.pkl"
+    return {key: value if isinstance(value, str) else json.dumps(value) for key, value in settings.items()}
 
 
 def build_config(
@@ -69,13 +87,9 @@ def build_config(
     with initialize_config_dir(config_dir=str(verl_pkg), version_base=None):
         base_cfg = compose(config_name="config")
 
-    overrides = OmegaConf.load(config_path)
-    smoke_overrides = overrides.pop("smoke", {})
-    if smoke:
-        overrides = OmegaConf.merge(overrides, smoke_overrides)
+    overrides = load_training_config(config_path)
+    experiment_name = overrides.pop("experiment", {}).get("name", base_cfg.trainer.experiment_name)
     overrides.pop("agents", None)
-    for key in ("train_files", "val_files"):
-        overrides.data[key] = str(config_path.resolve().parent / Path(overrides.data[key]).expanduser())
     base_cfg.agentlightning.k8s.job_template_path = str(EXAMPLE_DIR / "job-template-openai.yaml")
 
     if model:
@@ -87,7 +101,9 @@ def build_config(
 
     cli_override_conf = OmegaConf.from_dotlist(list(config_overrides))
     rollout_mode = OmegaConf.select(
-        cli_override_conf, "actor_rollout_ref.rollout.mode", default=overrides.actor_rollout_ref.rollout.mode
+        cli_override_conf,
+        "actor_rollout_ref.rollout.mode",
+        default=overrides.actor_rollout_ref.rollout.get("mode", base_cfg.actor_rollout_ref.rollout.mode),
     )
     model_path = OmegaConf.select(
         cli_override_conf, "actor_rollout_ref.model.path", default=overrides.actor_rollout_ref.model.path
@@ -106,7 +122,7 @@ def build_config(
         defaults = {"tool_call_parser": "hermes", "chat_template": str(EXAMPLE_DIR / "swe_smith_chat_template.jinja")}
     engine.vllm = OmegaConf.merge(defaults, engine.vllm)
 
-    experiment = overrides.trainer.experiment_name
+    experiment = overrides.trainer.get("experiment_name", experiment_name)
     overrides.trainer.experiment_name = f"{experiment}_{rollout_mode}_{Path(model_path).name}_{TRAIN_BACKEND}"
     if run_name:
         overrides.trainer.experiment_name += f"_{run_name}"
@@ -114,17 +130,20 @@ def build_config(
     OmegaConf.set_struct(base_cfg, False)
     config = OmegaConf.merge(base_cfg, overrides, cli_override_conf)
     OmegaConf.set_struct(config, False)
+    if os.environ.get("AGL_RUN_DIR"):
+        config.trainer.default_local_dir = str(Path(os.environ["AGL_RUN_DIR"]) / "checkpoints")
     rollout = config.actor_rollout_ref.rollout
     if smoke and rollout.name != "vllm":
         raise ValueError("Smoke requires vLLM.")
-    if rollout.name == "vllm" and (smoke or uses_qwen35):
+    if rollout.name == "vllm" and uses_qwen35:
         if OmegaConf.select(rollout, "engine_kwargs.vllm.gdn_prefill_backend") != "triton":
             raise ValueError("This vLLM profile requires gdn_prefill_backend=triton.")
     if OmegaConf.select(config, "ray_kwargs.ray_init.address") != "local":
         raise ValueError("Training requires its own local Ray instance.")
-    max_jobs = OmegaConf.select(config, "ray_kwargs.ray_init.runtime_env.env_vars.MAX_JOBS")
-    if max_jobs not in (None, 2, "2"):
-        raise ValueError("Training requires MAX_JOBS=2 in the Ray worker environment.")
+    env_vars = config.ray_kwargs.ray_init.runtime_env.env_vars
+    if str(env_vars.MAX_JOBS) not in {"1", "2"}:
+        raise ValueError("MAX_JOBS must be 1 or 2 for training on the shared GPU server.")
+    env_vars.MAX_JOBS = str(env_vars.MAX_JOBS)
     return config
 
 
@@ -143,22 +162,25 @@ def prepare_ray(config: DictConfig) -> None:
 
     env_path = "ray_kwargs.ray_init.runtime_env.env_vars"
     defaults = get_ppo_ray_runtime_env()["env_vars"]
-    overrides = OmegaConf.select(config, env_path) or {}
-    worker_env = {"MAX_JOBS": "2"}
-    if ipc_dir := os.environ.get("VERL_WEIGHT_TRANSFER_IPC_DIR"):
-        worker_env["VERL_WEIGHT_TRANSFER_IPC_DIR"] = ipc_dir
     # Agent Lightning replaces the whole env_vars map if the config supplies one.
-    env_vars = OmegaConf.merge(defaults, overrides, worker_env)
+    env_vars = OmegaConf.merge(defaults, OmegaConf.select(config, env_path))
+    if ipc_dir := os.environ.get("VERL_WEIGHT_TRANSFER_IPC_DIR"):
+        env_vars.VERL_WEIGHT_TRANSFER_IPC_DIR = ipc_dir
     OmegaConf.update(config, env_path, env_vars)
 
 
 def train(
     config: DictConfig,
     *,
+    agent_settings: dict[str, str],
     train_dataset_path: str | None = None,
     val_dataset_path: str | None = None,
     max_val_instances: int | None = None,
 ) -> None:
+    runtime_env = config.ray_kwargs.ray_init.runtime_env.env_vars
+    for name in ("MAX_JOBS", "VLLM_USE_FLASHINFER_MOE_FP16"):
+        os.environ[name] = str(runtime_env[name])
+
     import ray
 
     from agentlightning.verl.entrypoint import run_ppo
@@ -168,8 +190,13 @@ def train(
 
     train_dataset_path = train_dataset_path or config.data.train_files
     val_dataset_path = val_dataset_path or config.data.val_files
-    train_dataset = load_split_file(train_dataset_path)
-    val_dataset = load_split_file(val_dataset_path, max_instances=max_val_instances)
+    if not os.environ.get("AGL_RUN_DIR"):
+        raise RuntimeError("Start training with 'bash examples/swe_smith/run.sh train'.")
+    train_dataset = load_split_file(train_dataset_path, agent_settings=agent_settings)
+    count = config.data.get("max_train_instances")
+    if count is not None:
+        train_dataset = select_distinct_instances(train_dataset, count)
+    val_dataset = load_split_file(val_dataset_path, max_instances=max_val_instances, agent_settings=agent_settings)
     instances = train_dataset + val_dataset
     distinct_repos = sorted({row["repo"] for row in instances})
 
@@ -202,7 +229,7 @@ def train(
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(description="Train a SWE-smith agent with VERL/GRPO via Agent Lightning")
     parser.add_argument("--config", type=Path, default=os.environ.get("AGL_TRAIN_CONFIG", DEFAULT_CONFIG))
-    parser.add_argument("--smoke", action="store_true", help="Apply the smoke settings from the training config.")
+    parser.add_argument("--smoke", action="store_true", help="Check smoke requirements using the supplied config.")
     parser.add_argument(
         "--train-dataset-path",
         default=os.environ.get("AGL_TRAIN_DATASET_PATH"),
@@ -231,7 +258,6 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     args, config_overrides = parse_args()
-    os.environ["MAX_JOBS"] = "2"
     config = build_config(
         config_path=args.config,
         smoke=args.smoke,
@@ -243,6 +269,7 @@ def main() -> None:
     )
     train(
         config,
+        agent_settings=load_agent_settings(args.config, os.environ["AGL_RUN_NAME"]),
         train_dataset_path=args.train_dataset_path,
         val_dataset_path=args.val_dataset_path,
         max_val_instances=args.max_val_instances,

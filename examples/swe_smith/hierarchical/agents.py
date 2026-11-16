@@ -51,8 +51,7 @@ def _query(client: OpenAI, settings: ModelSettings, result: TaskResult, tools: l
         try:
             response = client.chat.completions.create(
                 messages=result.messages,
-                tools=tools,
-                parallel_tool_calls=False,
+                **({"tools": tools, "parallel_tool_calls": False} if tools else {}),
                 **settings.request_kwargs(),
             )
             break
@@ -76,6 +75,10 @@ def _query(client: OpenAI, settings: ModelSettings, result: TaskResult, tools: l
 
 def _tool_reply(result: TaskResult, call: Any, output: str) -> None:
     result.messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
+
+
+def _tool_error(result: TaskResult, kind: str) -> None:
+    result.tool_errors[kind] = result.tool_errors.get(kind, 0) + 1
 
 
 class SubAgent:
@@ -106,9 +109,21 @@ class SubAgent:
             ],
         )
         observation = "No commands executed."
-        for _ in range(self.config.subagent_steps):
+        for step in range(self.config.subagent_steps):
+            reporting = step == self.config.subagent_steps - 1
+            if reporting:
+                result.messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your action budget is exhausted. Return your final report now, without tool calls. "
+                            "Summarize findings, file changes, checks actually run and unfinished work "
+                            "from this conversation."
+                        ),
+                    }
+                )
             try:
-                choice = _query(self.client, settings, result, [BASH_TOOL])
+                choice = _query(self.client, settings, result, [] if reporting else [BASH_TOOL])
             except APIError as exc:
                 result.status, result.error = "failed", str(exc)
                 break
@@ -118,12 +133,17 @@ class SubAgent:
                 break
 
             message = choice.message
+            if reporting and message.tool_calls:
+                _tool_error(result, "unexpected_call")
+                result.error = "Tool call returned during final report"
+                break
             if message.tool_calls:
                 observation = self._execute_tool_calls(result, message.tool_calls) or observation
             elif choice.finish_reason == "tool_calls" or "<tool_call>" in (message.content or ""):
+                _tool_error(result, "unrecognized_call")
                 result.messages.append({"role": "user", "content": TOOL_RETRY})
             elif (message.content or "").strip():
-                result.status, result.summary = "completed", message.content
+                result.status, result.summary = ("step_limit" if reporting else "completed"), message.content
                 result.duration_s = time.perf_counter() - started
                 return result
             else:
@@ -135,18 +155,21 @@ class SubAgent:
 
     def _execute_tool_calls(self, result: TaskResult, calls: list) -> str | None:
         if len(calls) != 1:
+            _tool_error(result, "multiple_calls")
             for call in calls:
                 _tool_reply(result, call, "Call one tool at a time.")
             return None
 
         call = calls[0]
         if call.function.name != "bash":
+            _tool_error(result, "unknown_tool")
             _tool_reply(result, call, "Only Bash is available.")
             return None
 
         try:
             args = BashArgs.model_validate_json(call.function.arguments)
         except ValidationError as exc:
+            _tool_error(result, "invalid_arguments")
             _tool_reply(result, call, f"Invalid arguments: {exc}")
             return None
 
@@ -155,6 +178,8 @@ class SubAgent:
             output, rc = reason, 126
         else:
             output, rc = smith._run(args.command, self.config.command_timeout)
+        if rc != 0:
+            _tool_error(result, "command_failed")
         observation = f"Command: {args.command}\n" + smith.render_observation(rc, output, self.config.obs_char_cap)
         _tool_reply(result, call, observation)
         return observation
@@ -223,6 +248,7 @@ class Orchestrator:
             if message.tool_calls:
                 self._execute_tool_calls(result, message.tool_calls)
             elif choice.finish_reason == "tool_calls" or "<tool_call>" in (message.content or ""):
+                _tool_error(result, "unrecognized_call")
                 result.messages.append({"role": "user", "content": TOOL_RETRY})
             elif (message.content or "").strip():
                 result.status, result.summary = "completed", message.content
@@ -237,22 +263,26 @@ class Orchestrator:
 
     def _execute_tool_calls(self, result: TaskResult, calls: list) -> None:
         if len(calls) != 1:
+            _tool_error(result, "multiple_calls")
             for call in calls:
                 _tool_reply(result, call, "Call one tool at a time and read its result.")
             return
         call = calls[0]
         if call.function.name not in ORCHESTRATOR_SCHEMAS:
+            _tool_error(result, "unknown_tool")
             _tool_reply(result, call, "Available tools: create_subagent and assign_task.")
             return
         try:
             args = ORCHESTRATOR_SCHEMAS[call.function.name][0].model_validate_json(call.function.arguments)
         except ValidationError as exc:
+            _tool_error(result, "invalid_arguments")
             _tool_reply(result, call, f"Invalid arguments: {exc}")
             return
         if isinstance(args, CreateSubagentArgs):
             spec = self.create_subagent(args.name)
             output = {"agent_name": spec.name, "profile": spec.profile}
         elif args.agent not in self.agents:
+            _tool_error(result, "unknown_agent")
             available = ", ".join(self.agents) or "none yet"
             output = {"error": f"Unknown agent {args.agent!r}. Use the exact agent_name. Available: {available}."}
         else:

@@ -24,7 +24,7 @@ uv pip install docker
 
 Machine A also requires Docker, `kubectl`, and access to the Kubernetes cluster.
 
-On **Machine B (GPU training machine)**, use the [training environment installer](../examples/swe_smith/hierarchical/README.md#первый-шаг-grpo).
+On **Machine B (GPU training machine)**, use the [training setup and launch instructions](../examples/swe_smith/README.md).
 
 ## Data Preparation
 
@@ -40,21 +40,22 @@ The provided splits are derived from the original SWE-smith dataset, which conta
 
 The resulting data contains approximately 6,000 training examples and 400 validation examples. `train_dataset_mixed.jsonl` contains the mixed-difficulty training set, while `val_dataset_filtered.jsonl` contains the filtered validation set.
 
-Download the pre-split dataset archive from [Google Drive](https://drive.google.com/file/d/1q19DP53l4rldvBR2dkUhbaPI_mHVBVL1/view?usp=drive_link) on **both machines**, then extract it into `examples/swe_smith/`:
+For experiments using the larger splits, download the pre-split dataset archive from
+[Google Drive](https://drive.google.com/file/d/1q19DP53l4rldvBR2dkUhbaPI_mHVBVL1/view?usp=drive_link)
+on the GPU machine. The current `training.yaml` points to these larger splits.
 
-- **Machine A** reads the datasets to determine which repository images must be prepared.
-- **Machine B** reads the datasets to construct the training and validation inputs.
-
-The example reads these files by default:
+The larger splits contain these files:
 
 - `examples/swe_smith/train_dataset_mixed.jsonl`
 - `examples/swe_smith/val_dataset_filtered.jsonl`
 
-When using `run.sh`, custom paths can be selected with the `AGL_TRAIN_DATASET_PATH` and `AGL_VAL_DATASET_PATH` environment variables read by the launcher.
+When using `run.sh`, set custom paths in the experiment YAML under `data.train_files` and `data.val_files`.
 
 ## Repository Image Preparation
 
-On Machine A, prepare the repository images in the Docker daemon used by the Kubernetes nodes before starting the Controller:
+The controller can prepare the images automatically over SSH when `AGL_REMOTE_OUTPUT_DIR`
+is configured, as described in the example README. Alternatively, on Machine A prepare
+the images in the Docker daemon used by the Kubernetes nodes:
 
 ```bash
 python examples/swe_smith/pull_images.py \
@@ -66,45 +67,9 @@ This command installs the OpenAI SDK, Pydantic, and NumPy into each required SWE
 
 ## Training
 
-The distributed launcher has three roles and must be started in this order:
-
-```text
-server → controller → trainer
-```
-
-On **Machine B (GPU training machine)**, start the Gateway:
-
-```bash
-export AGL_SERVER_PUBLIC_HOST=<address-reachable-from-controller-and-pods>
-export AGL_KEY=<shared-secret>
-export AGL_MODEL_NAME=Qwen/Qwen3.5-9B
-examples/swe_smith/run.sh server
-```
-
-On **Machine A (Kubernetes Controller machine)**, start the Controller:
-
-```bash
-export AGL_SERVER_PUBLIC_HOST=<gateway-address>
-export AGL_KEY=<same-shared-secret>
-export AGL_NAMESPACE=agents
-examples/swe_smith/run.sh controller
-```
-
-After the Gateway and Controller are ready, start the trainer on **Machine B (GPU training machine)**:
-
-```bash
-export AGL_KEY=<same-shared-secret>
-export AGL_MODEL_NAME=Qwen/Qwen3.5-9B
-examples/swe_smith/run.sh trainer
-```
-
-The launcher passes additional arguments to `train_smith_agent.py`, including `verl` dotlist overrides:
-
-```bash
-examples/swe_smith/run.sh trainer \
-    trainer.total_training_steps=100 \
-    actor_rollout_ref.rollout.n=4
-```
+Start the three roles in order: server, controller, trainer. All experiment settings
+come from the GPU machine's YAML file. See the [SWE-smith instructions](../examples/swe_smith/README.md)
+for the current commands, machine-specific connection settings, and log locations.
 
 ## Preventing Reward Hacking
 

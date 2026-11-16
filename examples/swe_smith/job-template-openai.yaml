@@ -15,18 +15,24 @@ spec:
       containers:
         - name: agent
           image: {{ (input.image_name ~ ":arbas") | yaml_escape }}
-          command: ["bash", "-lc", "set -o pipefail && mkdir -p /agl-logs/new && cd /agl && python -m hierarchical.run 2>&1 | tee /agl-logs/new/{{ job_name }}.log"]
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              export HIER_OUTPUT_DIR="/agl-logs/$AGL_RUN_NAME/{{ job_name }}"
+              mkdir -p "$HIER_OUTPUT_DIR"
+              cd /agl
+              python -m hierarchical.run 2>&1 | tee "$HIER_OUTPUT_DIR/$AGL_RUN_NAME-{{ job_name }}.log"
           imagePullPolicy: IfNotPresent
-          envFrom:
-            - configMapRef:
-                name: swe-smith-settings
           env:
+            {% for name, value in input.arbas_agent_settings.items() %}
+            - name: {{ name | yaml_escape }}
+              value: {{ value | yaml_escape }}
+            {% endfor %}
             - name: AGL_TASK_INPUT
               value: {{ input.problem_statement | yaml_escape }}
             - name: AGL_ROLLOUT_JOB_NAME
               value: {{ job_name | yaml_escape }}
-            - name: HIER_OUTPUT_DIR
-              value: "/agl-logs/new/{{ job_name }}"
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:

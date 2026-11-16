@@ -11,7 +11,6 @@ build_dir=$(mktemp -d)
 trap 'rm -rf -- "$build_dir"' EXIT
 
 install_training() {
-  # Backport veRL #6551 while retaining the 0.8 trainer API used by Agent Lightning.
   curl -fsSL https://files.pythonhosted.org/packages/3b/f7/d5ff07531e10f0278d3f2f5bf9a0a9ddd5d8d3d3eb903e2dd34c70bee28f/verl-0.8.0.tar.gz \
     -o "$build_dir/verl-0.8.0.tar.gz"
   (cd "$build_dir" && sha256sum -c - <<'SHA256'
@@ -28,7 +27,6 @@ SHA256
   uv pip check --python .venv/bin/python
 }
 
-# Exact dependency pins, wheel metadata and the veRL patch used above.
 write_training_inputs() {
   cat > "$build_dir/requirements-training.txt" <<'REQUIREMENTS'
 # Generated with uv pip compile for Linux x86_64, Python 3.12 and CUDA 12.9.

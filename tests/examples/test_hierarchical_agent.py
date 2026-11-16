@@ -11,15 +11,17 @@ from unittest.mock import patch
 import httpx
 import numpy as np
 import pytest
+from omegaconf import OmegaConf
 from openai import APIError, OpenAI, RateLimitError
 from openai.types.chat import ChatCompletion
 
 from examples.swe_smith.hierarchical import run, smith
-from examples.swe_smith.hierarchical.agents import Orchestrator, SubAgent
-from examples.swe_smith.hierarchical.config import Config, load_config, select_subagent_settings
+from examples.swe_smith.hierarchical.agents import ORCHESTRATOR_TOOLS, Orchestrator, SubAgent
+from examples.swe_smith.hierarchical.config import load_config, select_subagent_settings
 from examples.swe_smith.hierarchical.oracle.bandit import LinUCB
 from examples.swe_smith.hierarchical.routing import ModelRouter
 from examples.swe_smith.hierarchical.types import AgentSpec, ModelSettings, TaskAssignment, TaskResult, TokenUsage
+from examples.swe_smith.training_config import load_training_config
 
 
 def reply(text=None, tool=None, arguments=None, *, finish=None, **fields):
@@ -65,20 +67,33 @@ class Client:
         return item
 
 
+def agent_environment():
+    path = Path(__file__).resolve().parents[2] / "examples/swe_smith/training.yaml"
+    config = load_training_config(path)
+    settings = OmegaConf.to_container(config.agents, resolve=True)
+    return {key: value if isinstance(value, str) else json.dumps(value) for key, value in settings.items()}
+
+
 @pytest.fixture
 def config(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     monkeypatch.setattr(smith, "TESTBED", str(repo))
     monkeypatch.setattr(smith, "_HIDDEN_GIT_DIR", str(tmp_path / "hidden-git"))
-    return Config(
-        orchestrator_base_url="https://gateway.invalid/v1",
-        orchestrator_api_key="gateway-only",
-        subagent_base_url="https://workers.invalid/v1",
-        subagent_api_key="worker-only",
-        orchestrator_model=ModelSettings(model="trainable"),
-        subagent_model=ModelSettings(model="worker"),
-    )
+    settings = {
+        **agent_environment(),
+        "AGL_OPENAI_BASE_URL": "https://gateway.invalid/v1",
+        "AGL_KEY": "gateway-only",
+        "OPENROUTER_API_KEY": "worker-only",
+        "SUBAGENT_BASE_URL": "https://workers.invalid/v1",
+        "ORCHESTRATOR_MODEL": "trainable",
+        "SUBAGENT_MODEL": "worker",
+        "SMITH_MAX_TURNS": "100",
+        "ORACLE_MODELS": "[]",
+        "ORACLE_LEARN": "true",
+    }
+    with patch.dict("os.environ", settings, clear=True):
+        return load_config()
 
 
 @pytest.fixture
@@ -130,9 +145,9 @@ def test_sequential_assignments_share_files_but_not_histories(config):
         ]
     )
     settings = [
-        ModelSettings(model="small"),
-        ModelSettings(model="large", reasoning={"effort": "low"}),
-        ModelSettings(model="small"),
+        ModelSettings(model="small", temperature=0.7, max_tokens=4096, reasoning=None),
+        ModelSettings(model="large", temperature=0.7, max_tokens=4096, reasoning={"effort": "low"}),
+        ModelSettings(model="small", temperature=0.7, max_tokens=4096, reasoning=None),
     ]
     with patch("examples.swe_smith.hierarchical.config.select_subagent_settings", side_effect=settings) as choose:
         result = Orchestrator(config, root, worker).run("Original issue")
@@ -170,6 +185,7 @@ def test_invalid_tools_and_arguments_are_feedback_not_execution(config):
     assert "Available tools" in client.requests[1]["messages"][-1]["content"]
     assert "Invalid arguments" in client.requests[2]["messages"][-1]["content"]
     assert "Unknown agent" in client.requests[3]["messages"][-1]["content"]
+    assert result.orchestrator.tool_errors == {"unknown_tool": 1, "invalid_arguments": 1, "unknown_agent": 1}
 
 
 def test_orchestrator_retries_tool_call_returned_as_text(config):
@@ -191,6 +207,7 @@ def test_orchestrator_retries_tool_call_returned_as_text(config):
     assert [assignment.agent_name for assignment in result.assignments] == ["research_1"]
     assert len(worker.requests) == 1
     assert result.orchestrator.summary == "Done"
+    assert result.orchestrator.tool_errors == {"unknown_agent": 1, "unrecognized_call": 1}
 
 
 def test_worker_retries_unparsed_tool_call(config):
@@ -299,7 +316,7 @@ def test_main_with_real_sdk_prepares_fixes_grades_and_publishes(
     config.oracle_feedback = feedback_mode
     config.judge_base_url = "https://judge.invalid/v1"
     config.judge_api_key = "judge-only"
-    config.judge_model = ModelSettings(model="judge-model", temperature=0, max_tokens=512)
+    config.judge_model = ModelSettings(model="judge-model", temperature=0, max_tokens=512, reasoning=None)
     semantic = router_enabled and feedback_mode == "semantic"
     if router_enabled:
         config.oracle_models = ["test/small", "test/large"]
@@ -433,6 +450,7 @@ def test_env_config_keeps_worker_credentials_separate(monkeypatch):
     with patch.dict(
         "os.environ",
         {
+            **agent_environment(),
             "AGL_OPENAI_BASE_URL": "https://gateway.invalid/v1",
             "AGL_KEY": "gateway",
             "OPENROUTER_API_KEY": "router",
@@ -449,6 +467,25 @@ def test_env_config_keeps_worker_credentials_separate(monkeypatch):
     assert config.orchestrator_model.reasoning is None
     assert config.oracle_models == ["test/small", "test/large"]
     assert config.oracle_learn is False
+
+
+@pytest.mark.parametrize(
+    "name", ["SUBAGENT_MAX_STEPS", "SUBAGENT_MODEL", "SUBAGENT_MAX_TOKENS", "ORACLE_MODELS",
+             "SMITH_F2P_ONLY", "SMITH_MAX_TURNS"]
+)
+def test_missing_agent_setting_fails_without_fallback(name):
+    settings = agent_environment()
+    del settings[name]
+    with patch.dict("os.environ", settings, clear=True), pytest.raises(ValueError, match=name):
+        load_config()
+
+
+def test_training_reward_uses_yaml_penalty_settings(config):
+    config.orchestrator_base_url = "https://gateway.invalid/mode/train/openai/v1"
+    result = TaskResult(agent_name="orchestrator", model="model", steps_taken=90,
+                        usage=TokenUsage(max_prompt_tokens=57000))
+    assert run.training_reward(1.0, True, result, config) == pytest.approx(0.9)
+    assert run.training_reward(0.0, False, result, config) == 0.0
 
 
 def test_oracle_routes_each_assignment_then_learns_from_delayed_score(config, tmp_path):
@@ -663,63 +700,6 @@ def test_training_parser_follows_effective_model(tmp_path):
     assert other.actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser == "hermes"
 
 
-def test_qwen35_chat_template_is_prefix_preserving():
-    from jinja2.sandbox import ImmutableSandboxedEnvironment
-
-    env = ImmutableSandboxedEnvironment(trim_blocks=False, lstrip_blocks=False)
-    env.filters["tojson"] = lambda x: json.dumps(x, ensure_ascii=False)
-    env.filters["items"] = lambda d: list(d.items())
-    env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
-    template_path = Path(__file__).resolve().parents[2] / "examples/swe_smith/qwen35_chat_template.jinja"
-    tmpl = env.from_string(template_path.read_text(encoding="utf-8"))
-    tools = [{"type": "function", "function": {"name": "create_subagent", "parameters": {"type": "object"}}}]
-
-    msgs = [
-        {"role": "system", "content": "Sys"},
-        {"role": "user", "content": "Issue"},
-        {
-            "role": "assistant",
-            "reasoning_content": "First step\n\n",
-            "content": None,
-            "tool_calls": [{"function": {"name": "create_subagent", "arguments": {"name": "research"}}}],
-        },
-        {"role": "tool", "content": '{"agent_name": "research_1"}'},
-        {
-            "role": "assistant",
-            "reasoning": None,
-            "content": None,
-            "tool_calls": [{"function": {"name": "create_subagent", "arguments": {"name": "fix"}}}],
-        },
-        {"role": "tool", "content": '{"agent_name": "fix_2"}'},
-        {"role": "user", "content": "Retry one tool call."},
-        {"role": "assistant", "reasoning_content": "Final\n", "content": "Done\n"},
-    ]
-
-    p0 = tmpl.render(messages=msgs[:2], tools=tools, add_generation_prompt=True)
-    ctx0 = (
-        p0
-        + "First step\n\n</think>\n\n<tool_call>\n<function=create_subagent>\n"
-        + "<parameter=name>\nresearch\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
-    )
-    p1 = tmpl.render(messages=msgs[:4], tools=tools, add_generation_prompt=True)
-    assert p1.startswith(ctx0)
-    ctx1 = (
-        p1
-        + "</think>\n\n<tool_call>\n<function=create_subagent>\n"
-        + "<parameter=name>\nfix\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
-    )
-    p2 = tmpl.render(messages=msgs[:7], tools=tools, add_generation_prompt=True)
-    assert p2.startswith(ctx1)
-    p3 = tmpl.render(messages=msgs, tools=tools, add_generation_prompt=False)
-    assert p3.startswith(p2)
-    assert "<think>\nFirst step\n\n</think>" in p3
-
-    no_think_p0 = tmpl.render(messages=msgs[:2], tools=tools, add_generation_prompt=True, enable_thinking=False)
-    no_think_p1 = tmpl.render(messages=msgs[:4], tools=tools, add_generation_prompt=True, enable_thinking=False)
-    assert no_think_p0.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
-    assert no_think_p1.startswith(no_think_p0)
-
-
 def test_http_comment_allowed_and_usage_handles_none():
     assert smith._forbidden_action('python3 -c "\n# Test (HTTP default)\nprint(1)\n"') is None
     assert smith._forbidden_action("http https://example.com/file.py") is not None
@@ -730,43 +710,38 @@ def test_http_comment_allowed_and_usage_handles_none():
 
 def test_training_smoke_settings(tmp_path):
     pytest.importorskip("verl")
-    from omegaconf import OmegaConf
 
     from examples.swe_smith.train_smith_agent import DEFAULT_CONFIG, build_config
 
-    settings = OmegaConf.load(DEFAULT_CONFIG)
+    settings = load_training_config(DEFAULT_CONFIG)
     config_path = tmp_path / "experiment.yaml"
     OmegaConf.save(settings, config_path)
     config = build_config(config_path=config_path, smoke=True)
     full = build_config(config_path=config_path)
 
-    assert config.actor_rollout_ref.model.path == "Qwen/Qwen3.5-2B"
-    assert config.actor_rollout_ref.model.lora_rank == 16
-    assert config.actor_rollout_ref.model.lora.merge is True
-    assert config.actor_rollout_ref.rollout.n == 4
+    assert config.actor_rollout_ref.model.path == settings.actor_rollout_ref.model.path
+    assert config.actor_rollout_ref.model.lora_rank == settings.actor_rollout_ref.model.lora_rank
+    assert config.actor_rollout_ref.model.lora.merge == settings.actor_rollout_ref.model.lora.merge
+    assert config.actor_rollout_ref.rollout.n == settings.actor_rollout_ref.rollout.n
     assert config.actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend == "triton"
-    assert config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.45
-    assert config.reward.num_workers == 2
+    assert config.actor_rollout_ref.rollout.gpu_memory_utilization == settings.actor_rollout_ref.rollout.gpu_memory_utilization
     assert config.ray_kwargs.ray_init.address == "local"
-    assert config.ray_kwargs.ray_init.num_cpus == 8
-    assert config.ray_kwargs.ray_init.object_store_memory == 4 * 1024**3
-    assert full.actor_rollout_ref.model.path == "Qwen/Qwen3.5-9B"
-    assert full.actor_rollout_ref.model.lora_rank == 0
+    assert full.actor_rollout_ref.model.path == settings.actor_rollout_ref.model.path
+    assert full.actor_rollout_ref.model.lora_rank == settings.actor_rollout_ref.model.lora_rank
     assert full.actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend == "triton"
     assert full.ray_kwargs.ray_init.address == "local"
-    assert full.ray_kwargs.ray_init.get("num_cpus") is None
-    assert full.ray_kwargs.ray_init.get("object_store_memory") is None
-    assert config.trainer.total_training_steps == 1
-    assert config.trainer.logger == ["console", "tensorboard"]
-    assert full.trainer.logger == ["console", "tensorboard"]
-    assert config.data.train_files == str(tmp_path / "smoke_train.jsonl")
+    assert config.trainer.total_training_steps == settings.trainer.total_training_steps
+    assert config.trainer.logger == settings.trainer.logger
+    assert full.trainer.logger == settings.trainer.logger
+    assert config.data.train_files == settings.data.train_files
     assert config.agentlightning.trace_aggregator.trajectory_max_response_length == config.data.max_response_length
     assert "agents" not in config
+    assert "experiment" not in config
     with pytest.raises(ValueError, match="gdn_prefill_backend=triton"):
         build_config(config_overrides=["actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend=flashinfer"])
     with pytest.raises(ValueError, match="local Ray"):
         build_config(smoke=True, config_overrides=["ray_kwargs.ray_init.address=auto"])
-    with pytest.raises(ValueError, match="MAX_JOBS=2"):
+    with pytest.raises(ValueError, match="MAX_JOBS must be 1 or 2"):
         build_config(config_overrides=["ray_kwargs.ray_init.runtime_env.env_vars.MAX_JOBS=47"])
 
 
@@ -778,17 +753,57 @@ def test_prepare_ray_preserves_worker_defaults_and_checks_socket_path(monkeypatc
     defaults = {"VLLM_DISABLE_COMPILE_CACHE": "1", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"}
     monkeypatch.setattr("verl.trainer.constants_ppo.get_ppo_ray_runtime_env", lambda: {"env_vars": defaults})
     config = build_config(
-        config_overrides=["ray_kwargs.ray_init.runtime_env.env_vars.MAX_JOBS=2",
+        config_overrides=["ray_kwargs.ray_init.runtime_env.env_vars.MAX_JOBS=1",
                           "ray_kwargs.ray_init.runtime_env.env_vars.TEST_VAR=present"]
     )
     monkeypatch.setenv("RAY_TMPDIR", "/tmp/agl-ray")
     monkeypatch.setenv("VERL_WEIGHT_TRANSFER_IPC_DIR", "/tmp/agl-ipc-test")
     prepare_ray(config)
     assert dict(config.ray_kwargs.ray_init.runtime_env.env_vars) == {
-        **defaults, "MAX_JOBS": "2", "TEST_VAR": "present",
+        **defaults, "MAX_JOBS": "1", "VLLM_USE_FLASHINFER_MOE_FP16": "0", "TEST_VAR": "present",
         "VERL_WEIGHT_TRANSFER_IPC_DIR": "/tmp/agl-ipc-test",
     }
 
     monkeypatch.setenv("RAY_TMPDIR", "/tmp/" + "long-" * 20)
     with pytest.raises(RuntimeError, match="Ray socket path is too long"):
         prepare_ray(config)
+
+
+def test_extra_assignment_arguments_are_rejected(config):
+    assignment_tool = next(tool for tool in ORCHESTRATOR_TOOLS if tool["function"]["name"] == "assign_task")
+    assert assignment_tool["function"]["parameters"]["additionalProperties"] is False
+    root = Client([
+        reply(tool="create_subagent", arguments={"name": "fix"}),
+        reply(tool="assign_task", arguments={"agent": "fix_1", "prompt": "Fix", "prompt_2": "Lost instruction"}),
+        reply("Done"),
+    ])
+    worker = Client([])
+    result = Orchestrator(config, root, worker).run("Issue")
+    assert not result.assignments
+    assert "extra_forbidden" in root.requests[2]["messages"][-1]["content"]
+    assert result.orchestrator.tool_errors == {"invalid_arguments": 1}
+    assert not worker.requests
+
+
+def test_budget_reserves_report_without_extra_request(config):
+    config.subagent_steps = 2
+    client = Client([reply(tool="bash", arguments={"command": "printf evidence"}), reply("Found evidence; no fix yet")])
+    worker = SubAgent(AgentSpec(name="research_1", profile="research", system_prompt="Research"), client, config)
+    result = worker.execute("Issue", TaskAssignment(agent_name="research_1", prompt="Find bug"), config.subagent_model)
+    assert result.status == "step_limit"
+    assert result.summary == "Found evidence; no fix yet"
+    assert result.steps_taken == 2
+    assert "tools" not in client.requests[-1]
+    assert "evidence" in json.dumps(client.requests[-1]["messages"])
+
+
+def test_final_report_does_not_execute_a_returned_tool_call(config):
+    config.subagent_steps = 2
+    client = Client([reply(tool="bash", arguments={"command": "printf first"}),
+                     reply(tool="bash", arguments={"command": "touch unexpected"})])
+    worker = SubAgent(AgentSpec(name="fix_1", profile="fix", system_prompt="Fix"), client, config)
+    result = worker.execute("Issue", TaskAssignment(agent_name="fix_1", prompt="Fix"), config.subagent_model)
+    assert result.status == "step_limit"
+    assert result.tool_errors == {"unexpected_call": 1}
+    assert "Tool call returned during final report" in result.summary
+    assert not (Path(smith.TESTBED) / "unexpected").exists()

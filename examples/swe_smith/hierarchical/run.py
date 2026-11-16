@@ -4,6 +4,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 from openai import APIError, OpenAI
@@ -25,7 +26,7 @@ def judge_connection(config: Config) -> tuple[str, str]:
 
 
 def evaluate_assignment(client: OpenAI, problem: str, result: TaskResult, config: Config) -> Judgment:
-    settings = config.judge_settings()
+    settings = config.judge_model
     judgment = Judgment(model=settings.model)
     assignment = result.assignment
     evidence = {
@@ -50,6 +51,7 @@ def evaluate_assignment(client: OpenAI, problem: str, result: TaskResult, config
             response_format={"type": "json_object"},
             **settings.request_kwargs(),
         )
+        judgment.usage.add(response.usage)
         choice = response.choices[0]
         judgment.response = choice.message.content or ""
         if choice.finish_reason != "stop" or choice.message.tool_calls:
@@ -102,20 +104,20 @@ def training_reward(raw_reward: float, resolved: bool, result: TaskResult, confi
         raw_reward,
         result.steps_taken,
         config.orchestrator_steps,
-        t0=int(os.environ.get("SMITH_LEN_PEN_T0", "80")),
-        lam=float(os.environ.get("SMITH_LEN_PEN_LAMBDA", "0.1")),
+        t0=config.length_penalty_start,
+        lam=config.length_penalty_weight,
         is_train=True,
     )
-    hard_cap = int(os.environ.get("SMITH_PROMPT_PEN_HARD_CAP", "64000"))
+    hard_cap = config.prompt_penalty_cap
     max_prompt_tokens = result.usage.max_prompt_tokens
     if max_prompt_tokens >= hard_cap:
         log.warning("max_prompt_tokens=%d >= hard_cap=%d (context near budget)", max_prompt_tokens, hard_cap)
     return smith.prompt_length_penalty(
         reward,
         max_prompt_tokens,
-        soft_start=int(os.environ.get("SMITH_PROMPT_PEN_SOFT_START", "50000")),
+        soft_start=config.prompt_penalty_start,
         hard_cap=hard_cap,
-        max_pen=float(os.environ.get("SMITH_PROMPT_PEN_MAX", "0.1")),
+        max_pen=config.prompt_penalty_max,
         is_train=True,
         solved=resolved,
     )
@@ -123,6 +125,7 @@ def training_reward(raw_reward: float, resolved: bool, result: TaskResult, confi
 
 def main() -> int:
     started = time.perf_counter()
+    started_at = datetime.now(timezone.utc).isoformat()
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[logging.StreamHandler(sys.stdout)]
     )
@@ -141,8 +144,8 @@ def main() -> int:
     judge_address = judge_connection(config) if config.oracle_models and config.oracle_feedback == "semantic" else None
     router = ModelRouter(config) if config.oracle_models else None
     max_turns = config.orchestrator_steps
-    eval_timeout = int(os.environ.get("SMITH_EVAL_TIMEOUT", "600"))
-    f2p_only = os.environ.get("SMITH_F2P_ONLY", "1").lower() not in ("0", "false", "no")
+    eval_timeout = config.eval_timeout
+    f2p_only = config.f2p_only
 
     log.info("SmithAgent start: instance=%s max_turns=%d", instance_id, max_turns)
     smith.checkout_bug_commit(instance_id)
@@ -232,6 +235,8 @@ def main() -> int:
         "rollout_wall": time.perf_counter() - started,
     }
     episode_metrics = {
+        "run_id": os.environ.get("AGL_RUN_NAME"),
+        "started_at": started_at,
         "job_name": os.environ.get("AGL_ROLLOUT_JOB_NAME"),
         "instance_id": instance_id,
         "reward": reward,

@@ -1,4 +1,4 @@
-"""Run the Linux trainer and clean up its processes even if the trainer dies."""
+"""Log the gateway and supervise the Linux trainer and its child processes."""
 
 import ctypes
 import os
@@ -12,6 +12,7 @@ from collections import defaultdict
 from contextlib import suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TextIO
 
 
 def stop_children(children: Path) -> None:
@@ -31,9 +32,43 @@ def stop_children(children: Path) -> None:
         time.sleep(0.05)
 
 
+def copy_output(stream: TextIO, log: TextIO) -> None:
+    key = os.environ["AGL_KEY"]
+    last_progress = None
+    for line in stream:
+        if "AglRolloutManager: completed=" in line:
+            if line == last_progress:
+                continue
+            last_progress = line
+        line = line.replace(key, "[redacted]")
+        log.write(line)
+        print(line, end="", flush=True)
+
+
+def run_logged_command(args: list[str], log_path: str) -> int:
+    def stop_command(signum, _frame) -> None:
+        raise SystemExit(128 + signum)
+
+    with (
+        open(log_path, "a", encoding="utf-8", buffering=1) as log,
+        subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace") as process,
+    ):
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, stop_command)
+        try:
+            copy_output(process.stdout, log)
+            status = process.wait()
+            return status if status >= 0 else 128 - status
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
+
 def run_trainer(args: list[str], log_path: str) -> int:
-    if sys.platform != "linux":
-        raise SystemExit("Run the GPU trainer on Linux.")
     children = Path("/proc/self/task") / str(threading.get_native_id()) / "children"
     children.read_text()  # Check that the kernel exposes child PIDs before starting training.
     libc = ctypes.CDLL(None, use_errno=True)
@@ -50,7 +85,6 @@ def run_trainer(args: list[str], log_path: str) -> int:
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, request_stop)
 
-    key = os.environ["AGL_KEY"]
     with open(log_path, "a", encoding="utf-8", buffering=1) as log:
         process = subprocess.Popen(
             [sys.executable, "-u", *args],
@@ -63,21 +97,13 @@ def run_trainer(args: list[str], log_path: str) -> int:
         )
         log_errors = []
 
-        def copy_output():
-            last_progress = None
+        def read_trainer_output():
             try:
-                for line in process.stdout:
-                    if "AglRolloutManager: completed=" in line:
-                        if line == last_progress:
-                            continue
-                        last_progress = line
-                    line = line.replace(key, "[redacted]")
-                    log.write(line)
-                    print(line, end="", flush=True)
+                copy_output(process.stdout, log)
             except OSError as exc:
                 log_errors.append(exc)
 
-        logger = threading.Thread(target=copy_output, daemon=True)
+        logger = threading.Thread(target=read_trainer_output, daemon=True)
         try:
             logger.start()
             while process.poll() is None and stop_signal is None and not log_errors:
@@ -125,6 +151,10 @@ def check_smoke(path: str) -> None:
 
 
 def main() -> int:
+    if sys.argv[1] == "--log-command":
+        _, log_path, *command = sys.argv[1:]
+        return run_logged_command(command, log_path)
+
     log_path, smoke_tmp, *trainer_args = sys.argv[1:]
     try:
         with TemporaryDirectory(prefix="agl-ipc-", dir="/tmp") as ipc_dir:

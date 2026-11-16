@@ -1,15 +1,15 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Profile = Literal["research", "fix", "verify"]
 
 
 class ModelSettings(BaseModel):
     model: str
-    temperature: float = 0.7
-    max_tokens: int = 4096
-    reasoning: dict[str, Any] | None = None
+    temperature: float
+    max_tokens: int
+    reasoning: dict[str, Any] | None
 
     def request_kwargs(self) -> dict[str, Any]:
         params = self.model_dump(exclude={"reasoning"})
@@ -48,6 +48,7 @@ class TokenUsage(BaseModel):
 
 
 class Judgment(BaseModel):
+    usage: TokenUsage = Field(default_factory=TokenUsage)
     model: str
     score: float | None = None
     reason: str = ""
@@ -65,6 +66,7 @@ class TaskResult(BaseModel):
     steps_taken: int = 0
     duration_s: float = 0.0
     usage: TokenUsage = Field(default_factory=TokenUsage)
+    tool_errors: dict[str, int] = Field(default_factory=dict)
     messages: list[dict[str, Any]] = Field(default_factory=list)
     assignment: TaskAssignment | None = None
     patch_before: str | None = None
@@ -78,16 +80,22 @@ class SwarmResult(BaseModel):
 
 
 class CreateSubagentArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: Profile
 
 
 class AssignTaskArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     agent: str
     prompt: str
     context: str = ""
 
 
 class BashArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     command: str
 
 

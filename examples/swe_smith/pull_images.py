@@ -15,7 +15,7 @@ import argparse
 import contextlib
 import json
 import shlex
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +29,17 @@ DEFAULT_DATASETS = (
 )
 ROLLOUT_IMAGE_TAG = "arbas"
 OPENAI_PACKAGE = "openai"
+
+
+def select_distinct_instances(rows: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+    if count <= 0:
+        raise ValueError("max_train_instances must be positive")
+    selected = {}
+    for row in rows:
+        selected.setdefault(row["instance_id"], row)
+        if len(selected) == count:
+            return list(selected.values())
+    raise ValueError(f"Need {count} distinct training tasks, found {len(selected)}")
 
 
 @dataclass(frozen=True)
@@ -54,7 +65,7 @@ def distinct_images(dataset: list[dict[str, Any]], limit: int | None) -> list[st
     if limit is not None:
         if limit <= 0:
             raise ValueError("--limit must be positive")
-        dataset = dataset[:limit]
+        dataset = select_distinct_instances(dataset, limit)
     images: list[str] = []
     for item in dataset:
         image = item.get("image_name")
@@ -62,6 +73,17 @@ def distinct_images(dataset: list[dict[str, Any]], limit: int | None) -> list[st
             raise ValueError(f"Instance {item.get('instance_id')} missing 'image_name'")
         if image not in images:
             images.append(image)
+    return images
+
+
+def experiment_images(config: Mapping[str, Any]) -> list[str]:
+    data = config["data"]
+    train_path = Path(data["train_files"])
+    images = distinct_images(load_dataset(train_path), data.get("max_train_instances"))
+    trainer = config["trainer"]
+    if trainer.get("val_before_train", True) or (trainer.get("test_freq") or -1) > 0:
+        val_path = Path(data["val_files"])
+        images = list(dict.fromkeys(images + distinct_images(load_dataset(val_path), None)))
     return images
 
 
@@ -164,14 +186,18 @@ def prepare_one(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare SWE-smith per-repo Docker images")
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
         "--dataset",
         action="append",
         default=None,
         help="SWE-smith JSONL to prepare images for. May be passed multiple times. "
         "Defaults to train_dataset_mixed.jsonl and val_dataset_filtered.jsonl.",
     )
-    parser.add_argument("--limit", type=int, default=None, help="only consider the first N instances")
+    selection.add_argument("--image", action="append", help="Prepare an image directly; may be passed multiple times.")
+    selection.add_argument("--config", type=Path, help="Select images using the experiment configuration.")
+    parser.add_argument("--list", action="store_true", help="Print selected images as JSON without preparing them.")
+    parser.add_argument("--limit", type=int, default=None, help="only consider the first N distinct instances")
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument(
         "--pull-missing",
@@ -188,20 +214,29 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    args = parse_args()
+    if args.config:
+        if __package__:
+            from .training_config import load_training_config
+        else:
+            from training_config import load_training_config
+
+        images = experiment_images(load_training_config(args.config))
+    elif args.image:
+        images = list(dict.fromkeys(args.image))
+    else:
+        dataset_paths = [Path(path) for path in (args.dataset or [str(path) for path in DEFAULT_DATASETS])]
+        dataset = load_datasets(dataset_paths)
+        images = distinct_images(dataset, args.limit)
+    if args.list:
+        print(json.dumps(images))
+        return
+
     try:
         import docker
     except ImportError as exc:
         raise SystemExit("pull_images.py requires the Docker SDK for Python: pip install docker") from exc
 
-    args = parse_args()
-    dataset_paths = [Path(path) for path in (args.dataset or [str(path) for path in DEFAULT_DATASETS])]
-    dataset = load_datasets(dataset_paths)
-    images = distinct_images(dataset, args.limit)
-
-    print("Datasets:")
-    for path in dataset_paths:
-        print(f"  {path}")
-    print(f"Instances: {len(dataset)} | distinct images: {len(images)}")
     print(f"Preparing local :{ROLLOUT_IMAGE_TAG} images for job-template-openai.yaml")
     for image in images:
         print(f"  {image} -> {openai_image_name(image)}")

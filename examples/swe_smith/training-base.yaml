@@ -1,12 +1,8 @@
-experiment:
-  include_routed_experts: false
-
 actor_rollout_ref:
   model:
     lora:
       merge: true
     use_fused_kernels: true
-
   actor:
     ppo_mini_batch_size: ${data.train_batch_size}
     ppo_micro_batch_size_per_gpu: 1
@@ -17,7 +13,6 @@ actor_rollout_ref:
       param_offload: true
       optimizer_offload: true
       entropy_from_logits_with_chunking: true
-
   rollout:
     name: vllm
     tensor_model_parallel_size: 1
@@ -56,36 +51,38 @@ ray_kwargs:
         VLLM_USE_FLASHINFER_MOE_FP16: "0"
 
 agents:
-  SMITH_CMD_TIMEOUT: 120
-  SMITH_EVAL_TIMEOUT: 600
-  HIER_API_TIMEOUT: 120
-  SMITH_GATEWAY_WAIT_S: 600
-  SMITH_OBS_CHAR_CAP: 6000
-  SMITH_F2P_ONLY: true
-  SMITH_LEN_PEN_T0: 80
-  SMITH_LEN_PEN_LAMBDA: 0.1
-  SMITH_PROMPT_PEN_SOFT_START: 50000
-  SMITH_PROMPT_PEN_HARD_CAP: 64000
-  SMITH_PROMPT_PEN_MAX: 0.1
-
-  ORCHESTRATOR_MODEL: auto
-  ORCHESTRATOR_TEMPERATURE: ${actor_rollout_ref.rollout.temperature}
-  ORCHESTRATOR_REASONING: null
-  SUBAGENT_BASE_URL: https://openrouter.ai/api/v1
-  SUBAGENT_MODEL: qwen/qwen3.5-9b
-  SUBAGENT_TEMPERATURE: 0.7
-  SUBAGENT_REASONING: null
-
-  ORACLE_MODELS: []
-  ORACLE_CHECKPOINT: auto
-  ORACLE_COST_WEIGHT: 0.2
-  ORACLE_COST_REF: 10000
-  ORACLE_LEARN: true
-  ORACLE_SEED: 0
-  ORACLE_FEEDBACK: semantic
-
-  JUDGE_BASE_URL: ""
-  JUDGE_MODEL: qwen/qwen3.5-9b
-  JUDGE_TEMPERATURE: 0
-  JUDGE_MAX_TOKENS: 1024
-  JUDGE_REASONING: null
+  orchestrator:
+    model: auto
+    temperature: ${actor_rollout_ref.rollout.temperature}
+    reasoning: null
+  subagent:
+    base_url: https://openrouter.ai/api/v1
+    temperature: 0.7
+    reasoning: null
+  sandbox:
+    cmd_timeout: 120
+    eval_timeout: 600
+    api_timeout: 120
+    gateway_wait_s: 600
+    obs_char_cap: 6000
+    f2p_only: true
+  reward:
+    len_pen_t0: 80
+    len_pen_lambda: 0.1
+    prompt_pen_soft_start: 50000
+    prompt_pen_hard_cap: 64000
+    prompt_pen_max: 0.1
+  oracle:
+    models: []
+    checkpoint: auto
+    cost_weight: 0.2
+    cost_ref: 10000
+    learn: true
+    seed: 0
+    feedback: semantic
+  judge:
+    base_url: ""
+    model: qwen/qwen3.5-9b
+    temperature: 0
+    max_tokens: 1024
+    reasoning: null

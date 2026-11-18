@@ -1,128 +1,91 @@
 # Запуск ARBAS
 
-Настройте `training.yaml` на GPU-сервере. Из корня репозитория запустите обучение
-и после появления подсказки запустите controller на Mac.
+Настройте `examples/swe_smith/training.yaml` на GPU-сервере. Из корня репозитория
+запустите обучение и после появления подсказки запустите controller на Mac.
 
 ```bash
 # На выделенной H200
 bash examples/swe_smith/run.sh train
 
-# На Mac, если для этой машины создан h200.env
+# На Mac, если создан профиль ~/.config/arbas/h200.env
 bash examples/swe_smith/run.sh controller h200
 ```
 
-На iPavlov `gpu12` сначала посмотрите доступные слоты через `gpu-run status`.
-Команду обучения запускайте внутри выделения `gpu-run`. Подставьте выбранную карту
-и число слотов в `GPU` и `SLOTS`. На Mac используйте `controller ipavlov`.
+На iPavlov `gpu12` сначала посмотрите доступные слоты через `gpu-run status` и
+запускайте обучение внутри выделения `gpu-run`. На Mac используйте `controller ipavlov`.
 
 ```bash
-gpu-run --gpu "$GPU" --slots "$SLOTS" -- bash examples/swe_smith/run.sh train ipavlov-2b-smoke
+gpu-run --gpu "$GPU" --slots "$SLOTS" -- bash examples/swe_smith/run.sh train ipavlov-2b
 ```
 
-`train` поднимает шлюз Agent Lightning и тренер. При завершении тренера или
-остановке команды шлюз закрывается. Controller создаёт контейнеры задач в
-Kubernetes и работает в своём терминале. Для нового запуска остановите его и
-запустите снова после старта шлюза. На обеих машинах нужна одна версия кода ARBAS.
+`train` поднимает шлюз `agl-server` и тренера VERL; при завершении или остановке
+команды шлюз и все дочерние процессы зачищаются автоматически. `controller`
+создаёт K8s Job-ы задач и работает в своём терминале. Для нового прогона
+остановите controller и запустите его снова после старта шлюза. На обеих машинах
+должна быть одна версия кода.
 
-Имя после `train` — подпись запуска. По умолчанию берётся `experiment.name`
-из YAML. К подписи автоматически добавляются московские дата и время и уникальный суффикс.
-Масштаб обучения всегда задаётся YAML. Слово `smoke` в имени служит для поиска логов.
+## Каталоги запусков
 
-## Однократная настройка
+Имя после `train` — подпись эксперимента (по умолчанию `experiment.name` из YAML).
+Каталог запуска создаётся в формате `outputs/swe-smith/<name>-<MMDD-HH>/` по
+московскому времени (при повторном запуске в тот же час добавляется суффикс
+`-2`, `-3`). Внутри сохраняются снимок `training.yaml`, логи
+`<run_id>-server.log` и `<run_id>-trainer.log`, TensorBoard и checkpoints.
+Симлинк `outputs/swe-smith/latest` указывает на последний запуск.
 
-Подготовьте GPU-окружение скриптом `setup_training.sh`. На Mac нужны Docker Desktop,
-Kubernetes, `kubectl` и Python-окружение проекта. Для автоматической подготовки
-образов установите в это окружение пакет `docker`. Скрипт подхватывает активное
-окружение или активирует `.venv` из корня репозитория.
+Временные файлы тренера и сокетов Ray изолируются во временной папке и
+гарантированно зачищаются при завершении. Для смены расположения временных файлов
+(например, если на `/tmp` мало места) укажите `AGL_TMPDIR` в `machine.env`.
 
-Создайте `~/.config/arbas/machine.env` на GPU-сервере:
+## Настройка окружения (`.env`)
+
+Подготовьте GPU-окружение скриптом `examples/swe_smith/setup_training.sh`.
+На Mac нужны Docker Desktop, Kubernetes, `kubectl` и Python-окружение проекта
+(с пакетом `docker` для автоматической сборки `:arbas`-образов). Скрипт `run.sh`
+подхватывает активное виртуальное окружение или `.venv` в корне репозитория и
+сохраняет `CUDA_VISIBLE_DEVICES`, выданный `gpu-run` или Slurm.
+
+На GPU-сервере создайте `~/.config/arbas/machine.env`:
+
+```env
+AGL_KEY=общий-ключ-связи
+```
+
+На Mac создайте `~/.config/arbas/ipavlov.env` (или `h200.env` / `machine.env`) из
+**4 обязательных полей**:
+
+```env
+SSH_TARGET=ipavlov-a100
+REMOTE_REPO_DIR=/data/home/valeriy_gaideek/arbas
+AGL_KEY=общий-ключ-связи
+OPENROUTER_API_KEY=ключ-openrouter
+```
+
+Порты (`18080` локально -> `8080` на сервере), адрес для подов
+(`http://host.docker.internal:18080`), привязка туннеля (`0.0.0.0`), namespace
+(`default`) и путь к `active.json` (`$REMOTE_REPO_DIR/outputs/swe-smith/active.json`)
+вычисляются автоматически и при необходимости переопределяются через
+`AGL_SERVER_PORT`, `AGL_SSH_REMOTE_PORT`, `AGL_SSH_BIND`, `AGL_SERVER_AGENT_URL`,
+`AGL_NAMESPACE`, `AGL_REMOTE_OUTPUT_DIR`. Ограничьте права: `chmod 600 ~/.config/arbas/*.env`.
+
+При запуске `controller` применяет один ConfigMap `swe-smith-agent-scripts` (из
+`examples/swe_smith/hierarchical/`), Secret `swe-smith-openrouter` и подтягивает
+образы из серверного `active.json` через `pull_images.py`.
+
+## Единый конфиг `training.yaml`
+
+Все параметры эксперимента, VERL, Ray и агентов собраны в одном файле
+`examples/swe_smith/training.yaml`. Для нового эксперимента скопируйте его рядом
+и передайте через `--config`:
 
 ```bash
-AGL_KEY='общий-ключ-связи'
+bash examples/swe_smith/run.sh train my-exp --config examples/swe_smith/my-exp.yaml
 ```
 
-Если GPU выдан планировщиком, скрипт сохраняет полученный `CUDA_VISIBLE_DEVICES`.
-При прямом запуске на выделенной карте задайте `CUDA_VISIBLE_DEVICES` для своего
-запуска. `trainer.n_gpus_per_node` в YAML должно соответствовать числу видимых
-устройств CUDA.
-
-На Mac создайте `~/.config/arbas/h200.env` и `~/.config/arbas/ipavlov.env` с
-параметрами соответствующих серверов. Для команды `controller` без аргумента
-используется `~/.config/arbas/machine.env` на Mac.
-
-```bash
-AGL_KEY='общий-ключ-связи'
-AGL_NAMESPACE=default
-AGL_SERVER_PORT=18080
-AGL_SERVER_AGENT_URL='http://host.docker.internal:18080'
-AGL_SSH_TARGET='ssh-алиас-сервера'
-AGL_SSH_BIND='0.0.0.0'
-AGL_REMOTE_OUTPUT_DIR='/абсолютный/путь/на/gpu/к/outputs/swe-smith'
-```
-
-`AGL_SSH_TARGET` берётся из вашей настройки SSH. Controller поднимает туннель
-до порта `8080` на сервере и закрывает его при остановке. Для другого удалённого
-порта задайте `AGL_SSH_REMOTE_PORT`. Если доступ к шлюзу прямой, задайте
-`AGL_SERVER_PUBLIC_HOST` и `AGL_SERVER_PORT` на Mac и `AGL_SERVER_BIND` на
-GPU-сервере. Pod должен видеть адрес `AGL_SERVER_AGENT_URL`. При привязке
-туннеля к `0.0.0.0` задайте свой `AGL_KEY`, одинаковый на обеих машинах.
-
-Controller читает список нужных образов из `AGL_REMOTE_OUTPUT_DIR` по SSH и
-готовит их в Docker, который видит Kubernetes. При ручной подготовке опустите
-эту переменную и используйте `pull_images.py --dataset /путь/к/датасету.jsonl`
-на машине с нужным Docker. Controller использует существующий Secret
-`swe-smith-openrouter`. Чтобы создать или обновить его при запуске, задайте
-`OPENROUTER_API_KEY` в конфигурации Mac. Храните файлы с ключами вне репозитория
-и ограничьте доступ к ним с помощью `chmod 600`.
-
-## Настройки эксперимента
-
-В `training-base.yaml` находятся общие настройки GRPO, vLLM, Ray и агентов,
-включая тайм-ауты, ORACLE и судью. `MAX_JOBS` находится в
-`ray_kwargs.ray_init.runtime_env.env_vars`. Тренер использует это значение и
-передаёт его процессам Ray. Допустимы `1` и `2` для ограничения параллельной сборки.
-`training.yaml` задаёт конкретный эксперимент и подключает базу через `base`.
-Значения из эксперимента перекрывают общие. Запуск сохраняет итоговый YAML,
-который используют шлюз и тренер. Список образов строится по этому же конфигу.
-
-Для следующего эксперимента можно скопировать `training.yaml` рядом и поменять
-нужные поля. Явно заданный `AGL_TRAIN_CONFIG` выбирает этот файл для запуска.
-
-```bash
-AGL_TRAIN_CONFIG=examples/swe_smith/my-experiment.yaml bash examples/swe_smith/run.sh train
-```
-
-Пути к базе и датасетам отсчитываются от YAML-файла, в котором они указаны.
-Обычный полный YAML без `base` также поддерживается.
-
-`training.yaml` настроен на проверку GRPO на одной выделенной H200. Оркестратор
-Qwen3.5‑2B обучается с LoRA rank 16. Тренер берёт первые две разные задачи из
-`train_dataset_mixed.jsonl`, по одной задаче на шаг и восемь попыток на задачу.
-Контекст vLLM — 32 768 токенов, лимиты — 32 хода оркестратора и 16 ходов исполнителя.
-Мини-батч следует за размером батча задач через ссылку на `data.train_batch_size`.
-
-Укажите путь к `train_dataset_mixed.jsonl` на GPU-сервере, если он находится
-в другой папке. Валидация отключена. Тренер всё равно читает включённый в
-репозиторий `smoke_val.jsonl` при создании загрузчика. Режим `check_smoke`
-готовит временный каталог и проверяет наличие полного шага GRPO в TensorBoard.
-Для подтверждения обучения посмотрите также разброс наград и `actor/grad_norm`.
-
-Пустой `agents.ORACLE_MODELS` оставляет фиксированного исполнителя Qwen3.5‑9B.
-Настройки ORACLE и судьи при необходимости переопределяются в `agents`. При
-`ORACLE_FEEDBACK: semantic` судья работает и с `ORACLE_LEARN: false`. Автоматический
-checkpoint ORACLE создаётся в `/agl-logs/<имя-запуска>/oracle/`. На нескольких
-узлах для единого состояния нужен общий том.
-
-## Где смотреть логи
-
-Скрипт печатает полный путь к каждому основному логу. На GPU-сервере откройте
-`outputs/swe-smith/latest` или папку конкретного запуска. Там находятся
-`<имя-запуска>-trainer.log`, `<имя-запуска>-server.log`, копия `training.yaml`,
-TensorBoard и настроенные checkpoints. Имя отличает файлы даже после копирования
-из папки запуска.
-
-На Mac controller записывает `<имя-запуска>-controller.log` в одноимённую папку
-под `outputs/swe-smith/`, если настроен `AGL_REMOTE_OUTPUT_DIR`. При ручной
-подготовке образов он использует собственную папку с датой запуска. Логи и JSON
-отдельных попыток находятся на узле Kubernetes в `/agl-logs/<имя-запуска>/`.
-В имени лога попытки есть имя запуска и идентификатор Kubernetes Job.
+Секция `agents:` валидируется схемой `AgentSettings` (`hierarchical/config.py`)
+прямо при старте до запуска Ray и передаётся в под одним JSON-параметром
+`ARBAS_AGENT_CONFIG`:
+- `orchestrator`, `subagent`, `judge` — модели, лимиты ходов/токенов, температура, `reasoning`;
+- `sandbox` — тайм-ауты команд/оценки/API, ожидание шлюза, лимит вывода, `f2p_only`;
+- `reward` — штрафы за число ходов и длину промпта на обучении;
+- `oracle` — список моделей (`models: []` отключает роутинг), чекпоинт `linucb.pkl`, веса стоимости и тип обратной связи (`semantic` / `episode`).

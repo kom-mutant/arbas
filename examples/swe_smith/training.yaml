@@ -1,12 +1,11 @@
 base: training-base.yaml
 
 experiment:
-  name: h200-grpo-2b
-  check_smoke: true
+  name: swe-smith-2b
 
 data:
   train_files: train_dataset_mixed.jsonl
-  val_files: smoke_val.jsonl  # Trainer loads this split even with validation disabled.
+  val_files: smoke_val.jsonl
   max_train_instances: 2
   train_batch_size: 1
   max_prompt_length: 16384
@@ -15,12 +14,12 @@ data:
 actor_rollout_ref:
   model:
     path: Qwen/Qwen3.5-2B
-    lora_rank: 0
+    lora_rank: 32
     lora_alpha: 32
   rollout:
-    n: 8
+    n: 4
     max_model_len: 32768
-    gpu_memory_utilization: 0.8
+    gpu_memory_utilization: 0.6
     enforce_eager: true
 
 trainer:
@@ -33,11 +32,15 @@ ray_kwargs:
   ray_init:
     num_cpus: 8
     object_store_memory: 4294967296  # 4 GiB
+
 reward:
   num_workers: 2
 
 agents:
-  SMITH_MAX_TURNS: 32
-  SUBAGENT_MAX_STEPS: 16
-  AGL_MAX_TOKENS: 4096
-  SUBAGENT_MAX_TOKENS: 4096
+  orchestrator:
+    max_turns: 32
+    max_tokens: 4096
+  subagent:
+    model: qwen/qwen3.5-9b
+    max_steps: 16
+    max_tokens: 4096

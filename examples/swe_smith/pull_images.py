@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Prepare SWE-smith images for Kubernetes rollouts.
-
-The default job template runs ``{image_name}:arbas`` so the agent starts
-without a runtime ``pip install``. This script prepares those local tags from
-the per-instance base images and only pulls a base image when it is missing
-from the active Docker daemon.
-"""
+"""Prepare SWE-smith images for Kubernetes rollouts as ``<image_name>:arbas``."""
 
 from __future__ import annotations
 
@@ -15,12 +9,14 @@ import argparse
 import contextlib
 import json
 import shlex
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+
+import yaml
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 DEFAULT_DATASETS = (
@@ -34,7 +30,7 @@ OPENAI_PACKAGE = "openai"
 def select_distinct_instances(rows: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
     if count <= 0:
         raise ValueError("max_train_instances must be positive")
-    selected = {}
+    selected: dict[str, dict[str, Any]] = {}
     for row in rows:
         selected.setdefault(row["instance_id"], row)
         if len(selected) == count:
@@ -51,14 +47,10 @@ class ImagePreparationResult:
 
 
 def load_dataset(path: Path) -> list[dict[str, Any]]:
-    items = [json.loads(line) for line in path.open() if line.strip()]
+    items = [json.loads(line) for line in path.open(encoding="utf-8") if line.strip()]
     if not items:
         raise ValueError(f"Dataset is empty: {path}")
     return items
-
-
-def load_datasets(paths: Sequence[Path]) -> list[dict[str, Any]]:
-    return [item for path in paths for item in load_dataset(path)]
 
 
 def distinct_images(dataset: list[dict[str, Any]], limit: int | None) -> list[str]:
@@ -78,30 +70,19 @@ def distinct_images(dataset: list[dict[str, Any]], limit: int | None) -> list[st
 
 def experiment_images(config: Mapping[str, Any]) -> list[str]:
     data = config["data"]
-    train_path = Path(data["train_files"])
-    images = distinct_images(load_dataset(train_path), data.get("max_train_instances"))
-    trainer = config["trainer"]
+    images = distinct_images(load_dataset(Path(data["train_files"])), data.get("max_train_instances"))
+    trainer = config.get("trainer") or {}
     if trainer.get("val_before_train", True) or (trainer.get("test_freq") or -1) > 0:
-        val_path = Path(data["val_files"])
-        images = list(dict.fromkeys(images + distinct_images(load_dataset(val_path), None)))
+        images = list(dict.fromkeys(images + distinct_images(load_dataset(Path(data["val_files"])), None)))
     return images
 
 
-def split_image_tag(image_name: str) -> tuple[str, str | None]:
+def openai_image_name(image_name: str) -> str:
     if not image_name:
         raise ValueError("image_name is required")
     if "@" in image_name:
         raise ValueError("digest-based image names are not supported")
-    last_slash_index = image_name.rfind("/")
-    last_colon_index = image_name.rfind(":")
-    if last_colon_index > last_slash_index:
-        return image_name[:last_colon_index], image_name[last_colon_index + 1 :]
-    return image_name, None
-
-
-def openai_image_name(image_name: str) -> str:
-    _, tag = split_image_tag(image_name)
-    if tag is not None:
+    if image_name.rfind(":") > image_name.rfind("/"):
         raise ValueError(
             f"SWE-smith image_name must be untagged because job-template-openai.yaml "
             f"uses '<image_name>:{ROLLOUT_IMAGE_TAG}': {image_name}"
@@ -109,43 +90,29 @@ def openai_image_name(image_name: str) -> str:
     return f"{image_name}:{ROLLOUT_IMAGE_TAG}"
 
 
-def get_image(client: Any, image: str) -> Any | None:
-    try:
-        return client.images.get(image)
-    except Exception:
-        return None
-
-
 def image_exists(client: Any, image: str) -> bool:
-    return get_image(client, image) is not None
+    try:
+        return client.images.get(image) is not None
+    except Exception:
+        return False
 
 
 def openai_dockerfile(source_image: str) -> str:
     install_cmd = (
-        f"python -m pip install --no-cache-dir {shlex.quote(OPENAI_PACKAGE)} "
-        "'pydantic>=2.10,<3' 'numpy>=1.23'"
+        f"python -m pip install --no-cache-dir {shlex.quote(OPENAI_PACKAGE)} 'pydantic>=2.10,<3' 'numpy>=1.23'"
     )
-    return "".join(
-        [
-            f"FROM {source_image}\n",
-            'LABEL agentlightning.swe-smith.openai-layer="1"\n',
-            f"RUN bash -lc {shlex.quote(install_cmd)}\n",
-        ]
+    return (
+        f"FROM {source_image}\n"
+        'LABEL agentlightning.swe-smith.openai-layer="1"\n'
+        f"RUN bash -lc {shlex.quote(install_cmd)}\n"
     )
 
 
 def build_openai_image(client: Any, source_image: str, target_image: str) -> None:
     dockerfile = openai_dockerfile(source_image)
     with TemporaryDirectory(prefix="swe-smith-openai-") as context_dir:
-        dockerfile_path = Path(context_dir) / "Dockerfile"
-        dockerfile_path.write_text(dockerfile)
-        client.images.build(
-            path=str(context_dir),
-            tag=target_image,
-            rm=True,
-            forcerm=True,
-            pull=False,
-        )
+        (Path(context_dir) / "Dockerfile").write_text(dockerfile, encoding="utf-8")
+        client.images.build(path=context_dir, tag=target_image, rm=True, forcerm=True, pull=False)
 
 
 def prepare_one(
@@ -184,31 +151,37 @@ def prepare_one(
         return ImagePreparationResult(source_image, target, "failed", str(exc))
 
 
+def _load_config_for_images(path: Path) -> dict[str, Any]:
+    resolved = path.expanduser().resolve()
+    cfg = yaml.safe_load(resolved.read_text(encoding="utf-8"))
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Expected mapping in {resolved}")
+    data = cfg.get("data") or {}
+    for field in ("train_files", "val_files"):
+        if data.get(field):
+            data[field] = str(resolved.parent / Path(data[field]).expanduser())
+    return cfg
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare SWE-smith per-repo Docker images")
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument(
-        "--dataset",
-        action="append",
-        default=None,
-        help="SWE-smith JSONL to prepare images for. May be passed multiple times. "
-        "Defaults to train_dataset_mixed.jsonl and val_dataset_filtered.jsonl.",
-    )
-    selection.add_argument("--image", action="append", help="Prepare an image directly; may be passed multiple times.")
-    selection.add_argument("--config", type=Path, help="Select images using the experiment configuration.")
+    selection.add_argument("--dataset", action="append", default=None, help="SWE-smith JSONL path (repeatable).")
+    selection.add_argument("--image", action="append", help="Prepare an image directly (repeatable).")
+    selection.add_argument("--config", type=Path, help="Select images using an experiment YAML.")
     parser.add_argument("--list", action="store_true", help="Print selected images as JSON without preparing them.")
-    parser.add_argument("--limit", type=int, default=None, help="only consider the first N distinct instances")
+    parser.add_argument("--limit", type=int, default=None, help="Only consider the first N distinct instances.")
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument(
         "--pull-missing",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="pull a base image only if it is not already loaded locally (default: true)",
+        help="Pull a base image only if missing locally (default: true).",
     )
     parser.add_argument(
         "--force-build",
         action="store_true",
-        help=f"rebuild :{ROLLOUT_IMAGE_TAG} images even when the target tag already exists",
+        help=f"Rebuild :{ROLLOUT_IMAGE_TAG} images even when the target tag already exists.",
     )
     return parser.parse_args()
 
@@ -216,18 +189,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.config:
-        if __package__:
-            from .training_config import load_training_config
-        else:
-            from training_config import load_training_config
-
-        images = experiment_images(load_training_config(args.config))
+        images = experiment_images(_load_config_for_images(args.config))
     elif args.image:
         images = list(dict.fromkeys(args.image))
     else:
-        dataset_paths = [Path(path) for path in (args.dataset or [str(path) for path in DEFAULT_DATASETS])]
-        dataset = load_datasets(dataset_paths)
-        images = distinct_images(dataset, args.limit)
+        dataset_paths = [Path(path) for path in (args.dataset or [str(p) for p in DEFAULT_DATASETS])]
+        rows = [item for path in dataset_paths for item in load_dataset(path)]
+        images = distinct_images(rows, args.limit)
     if args.list:
         print(json.dumps(images))
         return
@@ -245,14 +213,8 @@ def main() -> None:
     failed: list[ImagePreparationResult] = []
     with ThreadPoolExecutor(max_workers=args.max_workers) as pool:
         futures = {
-            pool.submit(
-                prepare_one,
-                client,
-                image,
-                pull_missing=args.pull_missing,
-                force_build=args.force_build,
-            ): image
-            for image in images
+            pool.submit(prepare_one, client, img, pull_missing=args.pull_missing, force_build=args.force_build): img
+            for img in images
         }
         for future in as_completed(futures):
             result = future.result()

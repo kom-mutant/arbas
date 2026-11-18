@@ -9,10 +9,14 @@ class ModelSettings(BaseModel):
     model: str
     temperature: float
     max_tokens: int
-    reasoning: dict[str, Any] | None
+    reasoning: dict[str, Any] | None = None
 
     def request_kwargs(self) -> dict[str, Any]:
-        params = self.model_dump(exclude={"reasoning"})
+        params: dict[str, Any] = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
         if self.reasoning is not None:
             params["extra_body"] = {"reasoning": self.reasoning}
         return params
@@ -57,7 +61,7 @@ class Judgment(BaseModel):
     latency_s: float | None = None
 
 
-class TaskResult(BaseModel):
+class AgentRunResult(BaseModel):
     agent_name: str
     model: str
     summary: str = ""
@@ -68,6 +72,9 @@ class TaskResult(BaseModel):
     usage: TokenUsage = Field(default_factory=TokenUsage)
     tool_errors: dict[str, int] = Field(default_factory=dict)
     messages: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AssignmentResult(AgentRunResult):
     assignment: TaskAssignment | None = None
     patch_before: str | None = None
     patch_after: str | None = None
@@ -75,8 +82,8 @@ class TaskResult(BaseModel):
 
 
 class SwarmResult(BaseModel):
-    orchestrator: TaskResult
-    assignments: list[TaskResult]
+    orchestrator: AgentRunResult
+    assignments: list[AssignmentResult]
 
 
 class CreateSubagentArgs(BaseModel):
@@ -89,7 +96,7 @@ class AssignTaskArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent: str
-    prompt: str
+    prompt: str = Field(min_length=1)
     context: str = ""
 
 
@@ -100,5 +107,5 @@ class BashArgs(BaseModel):
 
 
 class SemanticScore(BaseModel):
-    score: float = Field(ge=0, le=1)
+    score: float = Field(ge=0, le=1, allow_inf_nan=False)
     reason: str

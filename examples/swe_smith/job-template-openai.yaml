@@ -25,10 +25,10 @@ spec:
               python -m hierarchical.run 2>&1 | tee "$HIER_OUTPUT_DIR/$AGL_RUN_NAME-{{ job_name }}.log"
           imagePullPolicy: IfNotPresent
           env:
-            {% for name, value in input.arbas_agent_settings.items() %}
-            - name: {{ name | yaml_escape }}
-              value: {{ value | yaml_escape }}
-            {% endfor %}
+            - name: ARBAS_AGENT_CONFIG
+              value: {{ input.arbas_agent_config | yaml_escape }}
+            - name: AGL_RUN_NAME
+              value: {{ input.agl_run_name | yaml_escape }}
             - name: AGL_TASK_INPUT
               value: {{ input.problem_statement | yaml_escape }}
             - name: AGL_ROLLOUT_JOB_NAME
@@ -49,9 +49,6 @@ spec:
             - name: agent-scripts
               mountPath: /agl/hierarchical
               readOnly: true
-            - name: oracle-scripts
-              mountPath: /agl/hierarchical/oracle
-              readOnly: true
             - name: rollout-logs
               mountPath: /agl-logs
       volumes:
@@ -63,7 +60,3 @@ spec:
           hostPath:
             path: /agl-logs
             type: DirectoryOrCreate
-        - name: oracle-scripts
-          configMap:
-            name: swe-smith-oracle-scripts
-            defaultMode: 0755

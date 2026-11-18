@@ -1,27 +1,31 @@
+from __future__ import annotations
+
 import json
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
 from openai import APIError, OpenAI, RateLimitError
 from pydantic import ValidationError
 
-from . import config as configuration
 from . import smith
 from .config import Config
 from .prompts import ORCHESTRATOR_PROMPT, PROFILE_PROMPTS, SUBAGENT_PROMPT
 from .types import (
+    AgentRunResult,
     AgentSpec,
+    AssignmentResult,
     AssignTaskArgs,
     BashArgs,
     CreateSubagentArgs,
     ModelSettings,
+    Profile,
     SwarmResult,
     TaskAssignment,
-    TaskResult,
 )
 
 if TYPE_CHECKING:
-    from .routing import ModelRouter
+    from .oracle import ModelRouter
 
 BASH_TOOL = {
     "type": "function",
@@ -45,7 +49,13 @@ ORCHESTRATOR_TOOLS = [
 TOOL_RETRY = "Your tool call could not be read. Retry one tool call with its required arguments."
 
 
-def _query(client: OpenAI, settings: ModelSettings, result: TaskResult, tools: list[dict], gateway_wait: float = 0):
+def _query(
+    client: OpenAI,
+    settings: ModelSettings,
+    result: AgentRunResult,
+    tools: list[dict[str, Any]],
+    gateway_wait: float = 0,
+) -> Any:
     started = time.monotonic()
     while True:
         try:
@@ -73,12 +83,25 @@ def _query(client: OpenAI, settings: ModelSettings, result: TaskResult, tools: l
     return choice
 
 
-def _tool_reply(result: TaskResult, call: Any, output: str) -> None:
+def _tool_reply(result: AgentRunResult, call: Any, output: str) -> None:
     result.messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
 
 
-def _tool_error(result: TaskResult, kind: str) -> None:
+def _tool_error(result: AgentRunResult, kind: str) -> None:
     result.tool_errors[kind] = result.tool_errors.get(kind, 0) + 1
+
+
+def _unparsed_call(choice: Any, tool_names: tuple[str, ...]) -> bool:
+    if choice.finish_reason == "tool_calls":
+        return True
+    content = choice.message.content or ""
+    if "<tool_call>" in content or "<function=" in content:
+        return True
+    visible = re.sub(r"<think>.*?</think>", "", content, flags=re.S)
+    if "</think>" in visible:
+        visible = visible.split("</think>")[-1]
+    names = "|".join(re.escape(name) for name in tool_names)
+    return bool(re.search(rf"(?m)(?:^|\s)(?:{names})\s*\(", visible))
 
 
 class SubAgent:
@@ -87,9 +110,9 @@ class SubAgent:
         self.client = client
         self.config = config
 
-    def execute(self, problem: str, assignment: TaskAssignment, settings: ModelSettings) -> TaskResult:
+    def execute(self, problem: str, assignment: TaskAssignment, settings: ModelSettings) -> AssignmentResult:
         started = time.perf_counter()
-        result = TaskResult(
+        result = AssignmentResult(
             agent_name=self.spec.name,
             model=settings.model,
             assignment=assignment,
@@ -109,8 +132,9 @@ class SubAgent:
             ],
         )
         observation = "No commands executed."
-        for step in range(self.config.subagent_steps):
-            reporting = step == self.config.subagent_steps - 1
+        max_steps = self.config.subagent.max_steps
+        for step in range(max_steps):
+            reporting = step == max_steps - 1
             if reporting:
                 result.messages.append(
                     {
@@ -139,7 +163,7 @@ class SubAgent:
                 break
             if message.tool_calls:
                 observation = self._execute_tool_calls(result, message.tool_calls) or observation
-            elif choice.finish_reason == "tool_calls" or "<tool_call>" in (message.content or ""):
+            elif _unparsed_call(choice, ("bash",)):
                 _tool_error(result, "unrecognized_call")
                 result.messages.append({"role": "user", "content": TOOL_RETRY})
             elif (message.content or "").strip():
@@ -153,7 +177,7 @@ class SubAgent:
         result.duration_s = time.perf_counter() - started
         return result
 
-    def _execute_tool_calls(self, result: TaskResult, calls: list) -> str | None:
+    def _execute_tool_calls(self, result: AssignmentResult, calls: list[Any]) -> str | None:
         if len(calls) != 1:
             _tool_error(result, "multiple_calls")
             for call in calls:
@@ -177,41 +201,45 @@ class SubAgent:
         if reason:
             output, rc = reason, 126
         else:
-            output, rc = smith._run(args.command, self.config.command_timeout)
+            output, rc = smith._run(args.command, self.config.sandbox.cmd_timeout)
         if rc != 0:
             _tool_error(result, "command_failed")
-        observation = f"Command: {args.command}\n" + smith.render_observation(rc, output, self.config.obs_char_cap)
+        observation = f"Command: {args.command}\n" + smith.render_observation(
+            rc, output, self.config.sandbox.obs_char_cap
+        )
         _tool_reply(result, call, observation)
         return observation
 
 
 class Orchestrator:
     def __init__(
-        self, config: Config, client: OpenAI, subagent_client: OpenAI, router: "ModelRouter | None" = None
+        self,
+        config: Config,
+        client: OpenAI,
+        subagent_client: OpenAI,
+        router: ModelRouter | None = None,
     ) -> None:
         self.config = config
         self.client = client
         self.subagent_client = subagent_client
         self.router = router
         self.agents: dict[str, SubAgent] = {}
-        self.assignments: list[TaskResult] = []
+        self.assignments: list[AssignmentResult] = []
 
-    def create_subagent(self, name: str) -> AgentSpec:
+    def create_subagent(self, name: Profile) -> AgentSpec:
         spec = AgentSpec(name=f"{name}_{len(self.agents) + 1}", profile=name, system_prompt=PROFILE_PROMPTS[name])
         self.agents[spec.name] = SubAgent(spec, self.subagent_client, self.config)
         return spec
 
-    def assign_task(self, agent: str, prompt: str, context: str = "") -> TaskResult:
+    def assign_task(self, agent: str, prompt: str, context: str = "") -> AssignmentResult:
         worker = self.agents[agent]
         assignment = TaskAssignment(agent_name=agent, prompt=prompt, context=context)
-        settings = configuration.select_subagent_settings(
-            worker.spec,
-            assignment,
-            self.config.subagent_model,
-            problem=self.problem,
-            router=self.router,
+        settings = (
+            self.router.select(self.problem, worker.spec, assignment, self.config.subagent)
+            if self.router is not None
+            else self.config.subagent
         )
-        capture_evidence = self.router is not None and self.config.oracle_feedback == "semantic"
+        capture_evidence = self.router is not None and self.config.oracle.feedback == "semantic"
         patch_before = smith.capture_patch() if capture_evidence else None
         result = worker.execute(self.problem, assignment, settings)
         if capture_evidence:
@@ -223,18 +251,22 @@ class Orchestrator:
     def run(self, problem: str) -> SwarmResult:
         started = time.perf_counter()
         self.problem = problem
-        result = TaskResult(
+        result = AgentRunResult(
             agent_name="orchestrator",
-            model=self.config.orchestrator_model.model,
+            model=self.config.orchestrator.model,
             messages=[
                 {"role": "system", "content": ORCHESTRATOR_PROMPT},
                 {"role": "user", "content": problem},
             ],
         )
-        for _ in range(self.config.orchestrator_steps):
+        for _ in range(self.config.orchestrator.max_turns):
             try:
                 choice = _query(
-                    self.client, self.config.orchestrator_model, result, ORCHESTRATOR_TOOLS, self.config.gateway_wait_s
+                    self.client,
+                    self.config.orchestrator,
+                    result,
+                    ORCHESTRATOR_TOOLS,
+                    self.config.sandbox.gateway_wait_s,
                 )
             except APIError as exc:
                 result.status, result.error = "failed", str(exc)
@@ -247,7 +279,7 @@ class Orchestrator:
             message = choice.message
             if message.tool_calls:
                 self._execute_tool_calls(result, message.tool_calls)
-            elif choice.finish_reason == "tool_calls" or "<tool_call>" in (message.content or ""):
+            elif _unparsed_call(choice, tuple(ORCHESTRATOR_SCHEMAS)):
                 _tool_error(result, "unrecognized_call")
                 result.messages.append({"role": "user", "content": TOOL_RETRY})
             elif (message.content or "").strip():
@@ -261,7 +293,7 @@ class Orchestrator:
         result.duration_s = time.perf_counter() - started
         return SwarmResult(orchestrator=result, assignments=self.assignments)
 
-    def _execute_tool_calls(self, result: TaskResult, calls: list) -> None:
+    def _execute_tool_calls(self, result: AgentRunResult, calls: list[Any]) -> None:
         if len(calls) != 1:
             _tool_error(result, "multiple_calls")
             for call in calls:
@@ -280,7 +312,7 @@ class Orchestrator:
             return
         if isinstance(args, CreateSubagentArgs):
             spec = self.create_subagent(args.name)
-            output = {"agent_name": spec.name, "profile": spec.profile}
+            output: dict[str, Any] = {"agent_name": spec.name, "profile": spec.profile}
         elif args.agent not in self.agents:
             _tool_error(result, "unknown_agent")
             available = ", ".join(self.agents) or "none yet"

@@ -21,7 +21,6 @@ else:
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = EXAMPLE_DIR / "training.yaml"
-DEFAULT_BASE_CONFIG = EXAMPLE_DIR / "training-base.yaml"
 DATA_SOURCE = "swe_smith"
 TRAIN_BACKEND = "fsdp"
 
@@ -48,7 +47,7 @@ def load_experiment_config(config_path: Path) -> DictConfig:
     if base_file:
         candidate = (resolved.parent / Path(base_file).expanduser()).resolve()
         base_path = (
-            candidate if candidate.is_file() else (DEFAULT_BASE_CONFIG.parent / Path(base_file).expanduser()).resolve()
+            candidate if candidate.is_file() else (EXAMPLE_DIR / Path(base_file).expanduser()).resolve()
         )
         if not base_path.is_file():
             raise FileNotFoundError(f"Base config not found: {candidate} (or {base_path})")
@@ -125,6 +124,14 @@ def build_config(
     experiment_name = overrides.pop("experiment", {}).get("name", base_cfg.trainer.experiment_name)
     overrides.pop("agents", None)
     base_cfg.agentlightning.k8s.job_template_path = str(EXAMPLE_DIR / "job-template-openai.yaml")
+    base_cfg.agentlightning.local.agent_class = "examples.swe_smith.hierarchical.docker_runner:DockerRunner"
+    base_cfg.agentlightning.local.env_map = {
+        "IMAGE_NAME": "input.image_name",
+        "AGL_TASK_INPUT": "input.problem_statement",
+        "ARBAS_AGENT_CONFIG": "input.arbas_agent_config",
+        "AGL_RUN_NAME": "input.agl_run_name",
+        "DATA_ID": "input.data_id",
+    }
 
     if agl_base_url:
         OmegaConf.update(overrides, "agentlightning.agl_base_url", agl_base_url, merge=True)

@@ -1,21 +1,48 @@
 # Запуск ARBAS
 
-Настройте `examples/swe_smith/training.yaml` на GPU-сервере. Из корня репозитория
-запустите обучение и после появления подсказки запустите controller на Mac.
+Поддерживаются два режима запуска:
+1. **Автономный на одной машине / в Slurm** (`local` runner): обучение, шлюз, контроллер и SWE-smith роллауты запускаются прямо на сервере в локальном Docker. Подключение ноутбука или Kubernetes не требуется.
+2. **Распределённый** (`k8s` runner): GPU-обучение и шлюз работают на сервере, а контроллер запускается на Mac и шедулит задачи в локальный Kubernetes через SSH-туннель.
 
+---
+
+## Вариант 1: Автономный запуск (на сервере или в Slurm)
+
+Все процессы (шлюз `agl-server`, тренер VERL и контроллер `LocalReconciler`) работают на одной машине. Роллауты SWE-smith выполняются локально в изолированных контейнерах `docker run`.
+
+### В интерактивной сессии Slurm (rootless Docker):
 ```bash
-# На выделенной H200
-bash examples/swe_smith/run.sh train
+# 1. Запрос GPU и интерактивной сессии с rootless Docker
+srun -p gpu --time=04:00:00 --gres=gpu:h200:1 -c16 --mem=64G \
+  --pty slurm-docker-session --workspace arbas -- bash
 
-# На Mac, если создан профиль ~/.config/arbas/h200.env
-bash examples/swe_smith/run.sh controller h200
+# 2. В терминале 1: запуск обучения (поднимает шлюз и тренер VERL)
+bash examples/swe_smith/run.sh train smoke-h200
+
+# 3. В терминале 2 (или tmux): запуск локального контроллера
+bash examples/swe_smith/run.sh controller local
 ```
 
-На iPavlov `gpu12` сначала посмотрите доступные слоты через `gpu-run status` и
-запускайте обучение внутри выделения `gpu-run`. На Mac используйте `controller ipavlov`.
+Контроллер автоматически:
+- Подключается к локальному шлюзу `127.0.0.1:8080`.
+- Проверяет образы задач из `active.json` и при необходимости подтягивает их локально.
+- Запускает задачи через `DockerRunner` с монтированием `/agl/hierarchical:ro` и логов `/agl-logs`.
+- Пишет единый лог в `outputs/swe-smith/<run_id>/<run_id>-controller.log`.
 
+---
+
+## Вариант 2: Распределённый запуск (GPU-сервер + Mac с K8s)
+
+### 1. На GPU-сервере:
 ```bash
-gpu-run --gpu "$GPU" --slots "$SLOTS" -- bash examples/swe_smith/run.sh train ipavlov-2b
+# На выделенной H200 или внутри gpu-run на iPavlov gpu12
+bash examples/swe_smith/run.sh train
+```
+
+### 2. На Mac:
+```bash
+# Если создан профиль ~/.config/arbas/h200.env или ipavlov.env
+bash examples/swe_smith/run.sh controller h200
 ```
 
 `train` поднимает шлюз `agl-server` и тренера VERL; при завершении или остановке
@@ -58,8 +85,11 @@ AGL_KEY=общий-ключ-связи
 SSH_TARGET=ipavlov-a100
 REMOTE_REPO_DIR=/data/home/valeriy_gaideek/arbas
 AGL_KEY=общий-ключ-связи
-OPENROUTER_API_KEY=ключ-openrouter
+POLZA_API_KEY=ключ-polza
 ```
+
+Указывайте ключ провайдера из `agents.subagent.base_url`. Для OpenRouter
+используйте `OPENROUTER_API_KEY` вместо `POLZA_API_KEY`.
 
 Порты (`18080` локально -> `8080` на сервере), адрес для подов
 (`http://host.docker.internal:18080`), привязка туннеля (`0.0.0.0`), namespace
@@ -69,8 +99,9 @@ OPENROUTER_API_KEY=ключ-openrouter
 `AGL_NAMESPACE`, `AGL_REMOTE_OUTPUT_DIR`. Ограничьте права: `chmod 600 ~/.config/arbas/*.env`.
 
 При запуске `controller` применяет один ConfigMap `swe-smith-agent-scripts` (из
-`examples/swe_smith/hierarchical/`), Secret `swe-smith-openrouter` и подтягивает
-образы из серверного `active.json` через `pull_images.py`.
+`examples/swe_smith/hierarchical/`), сохраняет ключ в Secret `swe-smith-polza`
+или `swe-smith-openrouter` и подтягивает образы из серверного `active.json` через
+`pull_images.py`.
 
 ## Единый конфиг `training.yaml`
 

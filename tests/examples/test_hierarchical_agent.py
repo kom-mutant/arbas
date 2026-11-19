@@ -6,7 +6,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import numpy as np
@@ -14,14 +14,23 @@ import pytest
 from omegaconf import OmegaConf
 from openai import APIError, OpenAI, RateLimitError
 from openai.types.chat import ChatCompletion
+from pydantic import ValidationError
 
 from examples.swe_smith.hierarchical import run, smith
-from examples.swe_smith.hierarchical.agents import ORCHESTRATOR_TOOLS, Orchestrator, SubAgent
-from examples.swe_smith.hierarchical.config import load_config, select_subagent_settings
-from examples.swe_smith.hierarchical.oracle.bandit import LinUCB
-from examples.swe_smith.hierarchical.routing import ModelRouter
-from examples.swe_smith.hierarchical.types import AgentSpec, ModelSettings, TaskAssignment, TaskResult, TokenUsage
-from examples.swe_smith.training_config import load_training_config
+from examples.swe_smith.hierarchical.agents import ORCHESTRATOR_TOOLS, Orchestrator, SubAgent, _unparsed_call
+from examples.swe_smith.hierarchical.config import AgentSettings, load_config
+from examples.swe_smith.hierarchical.oracle import LinUCB, ModelRouter
+from examples.swe_smith.hierarchical.types import (
+    AgentRunResult,
+    AgentSpec,
+    AssignmentResult,
+    ModelSettings,
+    TaskAssignment,
+    TokenUsage,
+)
+from examples.swe_smith.train_smith_agent import build_agent_config, load_experiment_config
+
+TRAINING_YAML = Path(__file__).resolve().parents[2] / "examples/swe_smith/training.yaml"
 
 
 def reply(text=None, tool=None, arguments=None, *, finish=None, **fields):
@@ -67,11 +76,9 @@ class Client:
         return item
 
 
-def agent_environment():
-    path = Path(__file__).resolve().parents[2] / "examples/swe_smith/training.yaml"
-    config = load_training_config(path)
-    settings = OmegaConf.to_container(config.agents, resolve=True)
-    return {key: value if isinstance(value, str) else json.dumps(value) for key, value in settings.items()}
+def base_agent_settings_dict() -> dict:
+    config = load_experiment_config(TRAINING_YAML)
+    return OmegaConf.to_container(config.agents, resolve=True)
 
 
 @pytest.fixture
@@ -80,17 +87,18 @@ def config(tmp_path, monkeypatch):
     repo.mkdir()
     monkeypatch.setattr(smith, "TESTBED", str(repo))
     monkeypatch.setattr(smith, "_HIDDEN_GIT_DIR", str(tmp_path / "hidden-git"))
+    agent_cfg = base_agent_settings_dict()
+    agent_cfg["orchestrator"]["model"] = "trainable"
+    agent_cfg["orchestrator"]["max_turns"] = 100
+    agent_cfg["subagent"]["base_url"] = "https://workers.invalid/v1"
+    agent_cfg["subagent"]["model"] = "worker"
+    agent_cfg["oracle"]["models"] = []
+    agent_cfg["oracle"]["learn"] = True
     settings = {
-        **agent_environment(),
+        "ARBAS_AGENT_CONFIG": AgentSettings.model_validate(agent_cfg).model_dump_json(),
         "AGL_OPENAI_BASE_URL": "https://gateway.invalid/v1",
         "AGL_KEY": "gateway-only",
         "OPENROUTER_API_KEY": "worker-only",
-        "SUBAGENT_BASE_URL": "https://workers.invalid/v1",
-        "ORCHESTRATOR_MODEL": "trainable",
-        "SUBAGENT_MODEL": "worker",
-        "SMITH_MAX_TURNS": "100",
-        "ORACLE_MODELS": "[]",
-        "ORACLE_LEARN": "true",
     }
     with patch.dict("os.environ", settings, clear=True):
         return load_config()
@@ -149,9 +157,12 @@ def test_sequential_assignments_share_files_but_not_histories(config):
         ModelSettings(model="large", temperature=0.7, max_tokens=4096, reasoning={"effort": "low"}),
         ModelSettings(model="small", temperature=0.7, max_tokens=4096, reasoning=None),
     ]
-    with patch("examples.swe_smith.hierarchical.config.select_subagent_settings", side_effect=settings) as choose:
-        result = Orchestrator(config, root, worker).run("Original issue")
-    assert choose.call_count == 3
+    router = SimpleNamespace(select=MagicMock(side_effect=settings))
+    result = Orchestrator(config, root, worker, router=router).run("Original issue")
+    assert router.select.call_count == 3
+    assert isinstance(result.orchestrator, AgentRunResult)
+    assert not hasattr(result.orchestrator, "assignment")
+    assert not hasattr(result.orchestrator, "patch_before")
     assert [r.model for r in result.assignments] == ["small", "large", "small"]
     assert [r.agent_name for r in result.assignments] == ["fix_1", "verify_2", "fix_1"]
     assert [r.usage.total_tokens for r in result.assignments] == [240, 240, 120]
@@ -176,6 +187,7 @@ def test_invalid_tools_and_arguments_are_feedback_not_execution(config):
             reply(tool="bash", arguments={"command": "touch unexpected"}),
             reply(tool="create_subagent", arguments={"name": "unknown"}),
             reply(tool="assign_task", arguments={"agent": "missing", "prompt": "Fix"}),
+            reply(tool="assign_task", arguments={"agent": "missing", "prompt": ""}),
             reply("Cannot delegate"),
         ]
     )
@@ -185,7 +197,8 @@ def test_invalid_tools_and_arguments_are_feedback_not_execution(config):
     assert "Available tools" in client.requests[1]["messages"][-1]["content"]
     assert "Invalid arguments" in client.requests[2]["messages"][-1]["content"]
     assert "Unknown agent" in client.requests[3]["messages"][-1]["content"]
-    assert result.orchestrator.tool_errors == {"unknown_tool": 1, "invalid_arguments": 1, "unknown_agent": 1}
+    assert "Invalid arguments" in client.requests[4]["messages"][-1]["content"]
+    assert result.orchestrator.tool_errors == {"unknown_tool": 1, "invalid_arguments": 2, "unknown_agent": 1}
 
 
 def test_orchestrator_retries_tool_call_returned_as_text(config):
@@ -213,10 +226,32 @@ def test_orchestrator_retries_tool_call_returned_as_text(config):
 def test_worker_retries_unparsed_tool_call(config):
     client = Client([reply("Attempting Bash", finish="tool_calls"), reply("Done")])
     worker = SubAgent(AgentSpec(name="fix_1", profile="fix", system_prompt="Fix"), client, config)
-    result = worker.execute("Issue", TaskAssignment(agent_name="fix_1", prompt="Fix"), config.subagent_model)
+    result = worker.execute("Issue", TaskAssignment(agent_name="fix_1", prompt="Fix"), config.subagent)
 
     assert "Retry one tool call" in client.requests[1]["messages"][-1]["content"]
     assert result.summary == "Done"
+
+
+@pytest.mark.parametrize(
+    ("text", "finish", "tools", "expected"),
+    [
+        ("Attempting", "tool_calls", ("bash",), True),
+        ('<tool_call>{"name": "bash"}</tool_call>', "stop", ("bash",), True),
+        ("<function=assign_task>\n<parameter=agent>fix_1</parameter>", "stop", ("assign_task",), True),
+        ('create_subagent(name="research")', "stop", ("create_subagent", "assign_task"), True),
+        ('Next:\nassign_task(agent="fix_1", prompt="x")', "stop", ("create_subagent", "assign_task"), True),
+        ('I will call bash(command="ls") now.', "stop", ("bash",), True),
+        ('<think>Maybe bash(command="ls")</think>\nFixed calc.py.', "stop", ("bash",), False),
+        ('Maybe bash(command="ls")</think>\nFixed calc.py.', "stop", ("bash",), False),
+        ('Done</think>\nbash(command="ls")', "stop", ("bash",), True),
+        ("Used create_subagent and assign_task to fix the bug.", "stop", ("create_subagent", "assign_task"), False),
+        ("The helper `bash(cmd)` was checked.", "stop", ("bash",), False),
+        ("my_bash(x) works properly.", "stop", ("bash",), False),
+    ],
+)
+def test_unparsed_call_detector_distinguishes_text_calls_from_reports(text, finish, tools, expected):
+    choice = reply(text, finish=finish).choices[0]
+    assert _unparsed_call(choice, tools) is expected
 
 
 @pytest.mark.parametrize("actor", ["orchestrator", "worker"])
@@ -226,7 +261,7 @@ def test_length_cutoff_never_executes_tools(config, actor):
         result = Orchestrator(config, client, Client([])).run("Issue").orchestrator
     else:
         worker = SubAgent(AgentSpec(name="fix_1", profile="fix", system_prompt="Fix"), client, config)
-        result = worker.execute("Issue", TaskAssignment(agent_name="fix_1", prompt="Fix"), config.subagent_model)
+        result = worker.execute("Issue", TaskAssignment(agent_name="fix_1", prompt="Fix"), config.subagent)
     assert result.status == "failed"
     assert result.usage.total_tokens == 120
     assert not (Path(smith.TESTBED) / "unexpected").exists()
@@ -236,7 +271,7 @@ def test_api_failure_keeps_command_evidence_and_tokens(config):
     error = APIError("offline", httpx.Request("POST", "https://workers.invalid"), body=None)
     client = Client([reply(tool="bash", arguments={"command": "printf partial > partial.py && cat partial.py"}), error])
     worker = SubAgent(AgentSpec(name="fix_1", profile="fix", system_prompt="Fix"), client, config)
-    result = worker.execute("Issue", TaskAssignment(agent_name="fix_1", prompt="Fix"), config.subagent_model)
+    result = worker.execute("Issue", TaskAssignment(agent_name="fix_1", prompt="Fix"), config.subagent)
     assert result.status == "failed"
     assert result.usage.total_tokens == 120
     assert "partial" in result.summary
@@ -250,9 +285,9 @@ def test_router_programming_error_is_not_hidden(config):
             reply(tool="assign_task", arguments={"agent": "fix_1", "prompt": "Fix"}),
         ]
     )
-    with patch("examples.swe_smith.hierarchical.config.select_subagent_settings", side_effect=ValueError("router bug")):
-        with pytest.raises(ValueError, match="router bug"):
-            Orchestrator(config, root, Client([])).run("Issue")
+    router = SimpleNamespace(select=MagicMock(side_effect=ValueError("router bug")))
+    with pytest.raises(ValueError, match="router bug"):
+        Orchestrator(config, root, Client([]), router=router).run("Issue")
 
 
 def test_gateway_pause_waits_without_consuming_a_step(config):
@@ -268,11 +303,14 @@ def test_gateway_pause_waits_without_consuming_a_step(config):
 
 def test_shell_timeout_stops_background_children_and_hides_keys(config, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "secret-router-value")
+    monkeypatch.setenv("POLZA_API_KEY", "secret-polza-value")
     monkeypatch.setenv("AGL_KEY", "secret-gateway-value")
     monkeypatch.setenv("JUDGE_API_KEY", "secret-judge-value")
     output, rc = smith._run("env", 2)
     assert rc == 0
     assert "secret-router-value" not in output
+    assert "POLZA_API_KEY=" not in output
+    assert "secret-polza-value" not in output
     assert "secret-gateway-value" not in output
     assert "secret-judge-value" not in output
     _, rc = smith._run("(sleep 0.3; touch orphan) & wait", 0.03)
@@ -293,15 +331,15 @@ def test_shell_timeout_stops_background_children_and_hides_keys(config, monkeypa
 def test_reward_retries_are_finite(error, attempts):
     with (
         patch.dict("os.environ", {"AGL_EVENT_URL": "https://events.invalid"}),
-        patch.object(smith.urllib.request, "urlopen", side_effect=error) as send,
-        patch.object(smith.time, "sleep"),
+        patch.object(run.urllib.request, "urlopen", side_effect=error) as send,
+        patch.object(run.time, "sleep"),
     ):
-        smith.post_event("reward", {"value": 0}, retry=True)
+        run.post_event("reward", {"value": 0}, retry=True)
     assert send.call_count == attempts
 
 
 @pytest.mark.parametrize(
-    "router_enabled,feedback_mode,fixes_bug,judge_valid",
+    ("router_enabled", "feedback_mode", "fixes_bug", "judge_valid"),
     [
         (False, "semantic", True, True),
         (True, "episode", True, True),
@@ -313,14 +351,17 @@ def test_reward_retries_are_finite(error, attempts):
 def test_main_with_real_sdk_prepares_fixes_grades_and_publishes(
     task, config, tmp_path, monkeypatch, router_enabled, feedback_mode, fixes_bug, judge_valid
 ):
-    config.oracle_feedback = feedback_mode
-    config.judge_base_url = "https://judge.invalid/v1"
+    config.oracle.feedback = feedback_mode
+    config.judge.base_url = "https://judge.invalid/v1"
     config.judge_api_key = "judge-only"
-    config.judge_model = ModelSettings(model="judge-model", temperature=0, max_tokens=512, reasoning=None)
+    config.judge.model = "judge-model"
+    config.judge.temperature = 0
+    config.judge.max_tokens = 512
+    config.judge.reasoning = None
     semantic = router_enabled and feedback_mode == "semantic"
     if router_enabled:
-        config.oracle_models = ["test/small", "test/large"]
-        config.oracle_checkpoint = str(tmp_path / "router.pkl")
+        config.oracle.models = ["test/small", "test/large"]
+        config.oracle.checkpoint = str(tmp_path / "router.pkl")
     task_prompt = "Fix addition" if fixes_bug else "Locate the arithmetic mistake and explain it"
     command = "sed -i.bak 's/a - b/a + b/' calc.py && rm calc.py.bak" if fixes_bug else "cat calc.py"
     score = 0.75 if fixes_bug else 1.0
@@ -339,7 +380,9 @@ def test_main_with_real_sdk_prepares_fixes_grades_and_publishes(
         ],
         "workers.invalid": commands,
         "judge.invalid": [
-            reply(json.dumps({"score": score, "reason": "Evidence supports the assigned work"}) if judge_valid else "bad")
+            reply(
+                json.dumps({"score": score, "reason": "Evidence supports the assigned work"}) if judge_valid else "bad"
+            )
         ],
     }
     requests = []
@@ -368,9 +411,9 @@ def test_main_with_real_sdk_prepares_fixes_grades_and_publishes(
 
     def publish(*args, **kwargs):
         if semantic:
-            assert replies["judge.invalid"] == []  # Scores exist before Lightning can start backward.
+            assert replies["judge.invalid"] == []
         if router_enabled:
-            assert LinUCB.load(config.oracle_checkpoint).n_update == int(not semantic or judge_valid)
+            assert LinUCB.load(config.oracle.checkpoint).n_update == int(not semantic or judge_valid)
 
     monkeypatch.setenv("AGL_TASK_INPUT", "Fix addition")
     monkeypatch.setenv("AGL_EVAL_META", json.dumps(task))
@@ -378,14 +421,13 @@ def test_main_with_real_sdk_prepares_fixes_grades_and_publishes(
     with (
         patch.object(run, "load_config", return_value=config),
         patch.object(run, "OpenAI", side_effect=make_client),
-        patch(
-            "examples.swe_smith.hierarchical.config.select_subagent_settings", wraps=select_subagent_settings
-        ) as choose,
-        patch.object(smith, "post_event", side_effect=publish) as send,
+        patch.object(ModelRouter, "select", autospec=True, wraps=ModelRouter.select) as choose,
+        patch.object(run, "post_event", side_effect=publish) as send,
     ):
         assert run.main() == 0
-    assert choose.call_count == 1
-    assert choose.call_args.kwargs["problem"] == "Fix addition"
+    if router_enabled:
+        assert choose.call_count == 1
+        assert choose.call_args.args[1] == "Fix addition"
     saved_text = (tmp_path / "results/fixture-instance.json").read_text()
     saved = json.loads(saved_text)
     assert saved["reward"] == int(fixes_bug)
@@ -418,7 +460,6 @@ def test_main_with_real_sdk_prepares_fixes_grades_and_publishes(
     assert [c.args[0] for c in send.call_args_list] == ["agent_output", "reward"]
     assert send.call_args_list[1].args[1]["value"] == int(fixes_bug)
     if router_enabled:
-        assert isinstance(choose.call_args.kwargs["router"], ModelRouter)
         decision = saved["oracle"]["decisions"][0]
         worker_requests = [json.loads(r.content) for r in requests if r.url.host == "workers.invalid"]
         assert {r["model"] for r in worker_requests} == {decision["model"]}
@@ -431,67 +472,197 @@ def test_main_with_real_sdk_prepares_fixes_grades_and_publishes(
         else:
             assert decision["reward"] == pytest.approx(0.8 * expected_score - 0.2 * 40 / 10000)
         assert decision["learned"] == (not semantic or judge_valid)
-        assert LinUCB.load(config.oracle_checkpoint).n_update == int(not semantic or judge_valid)
+        assert LinUCB.load(config.oracle.checkpoint).n_update == int(not semantic or judge_valid)
     else:
-        assert choose.call_args.kwargs["router"] is None
         assert "oracle" not in saved
+
+
+@pytest.mark.parametrize("failure_stage", ["judge", "feedback"])
+def test_main_publishes_and_saves_even_when_judge_or_feedback_raises(
+    task, config, tmp_path, monkeypatch, failure_stage
+):
+    config.oracle.models = ["test/small", "test/large"]
+    config.oracle.checkpoint = str(tmp_path / "router.pkl")
+    config.oracle.feedback = "semantic"
+    config.judge.base_url = "https://judge.invalid/v1"
+    config.judge_api_key = "judge-only"
+
+    replies = {
+        "gateway.invalid": [
+            reply(tool="create_subagent", arguments={"name": "fix"}),
+            reply(tool="assign_task", arguments={"agent": "fix_1", "prompt": "Fix addition"}),
+            reply("Fixed"),
+        ],
+        "workers.invalid": [
+            reply(tool="bash", arguments={"command": "sed -i.bak 's/a - b/a + b/' calc.py && rm calc.py.bak"}),
+            reply("Fixed calc.py"),
+        ],
+    }
+
+    def respond(request):
+        return httpx.Response(200, json=replies[request.url.host].pop(0).model_dump(mode="json"))
+
+    def make_client(**kwargs):
+        return OpenAI(**kwargs, http_client=httpx.Client(transport=httpx.MockTransport(respond)))
+
+    monkeypatch.setenv("AGL_TASK_INPUT", "Fix addition")
+    monkeypatch.setenv("AGL_EVAL_META", json.dumps(task))
+    monkeypatch.setenv("HIER_OUTPUT_DIR", str(tmp_path / "results"))
+
+    judge_patch = (
+        patch.object(run, "judge_assignments", side_effect=RuntimeError("judge down"))
+        if failure_stage == "judge"
+        else patch.object(run, "judge_assignments", return_value=[1.0])
+    )
+    feedback_patch = (
+        patch.object(ModelRouter, "feedback", side_effect=OSError("disk full"))
+        if failure_stage == "feedback"
+        else patch.object(ModelRouter, "feedback", wraps=ModelRouter.feedback, autospec=True)
+    )
+
+    with (
+        patch.object(run, "load_config", return_value=config),
+        patch.object(run, "OpenAI", side_effect=make_client),
+        judge_patch,
+        feedback_patch,
+        patch.object(run, "post_event") as send,
+        pytest.raises(RuntimeError if failure_stage == "judge" else OSError),
+    ):
+        run.main()
+
+    assert [c.args[0] for c in send.call_args_list] == ["agent_output", "reward"]
+    assert send.call_args_list[1].args[1]["value"] == 1.0
+    assert send.call_args_list[1].args[1]["resolved"] is True
+    saved = json.loads((tmp_path / "results/fixture-instance.json").read_text())
+    assert saved["reward"] == 1.0
+    assert saved["resolved"] is True
 
 
 def test_unfixed_source_is_not_rewarded_and_pytest_cannot_be_shadowed(task):
     smith.checkout_bug_commit(task["instance_id"])
     smith.relocate_git()
     (Path(smith.TESTBED) / "pytest.py").write_text("print('PASSED test_calc.py::test_add')\n")
-    reward, resolved, _, _ = smith.evaluate(task, 20)
-    assert reward == 0
-    assert not resolved
+    ev = smith.evaluate(task, 20)
+    assert ev.reward == 0.0
+    assert not ev.resolved
 
 
-def test_env_config_keeps_worker_credentials_separate(monkeypatch):
+def test_syntax_error_returns_zero_reward_without_raising(task):
+    smith.checkout_bug_commit(task["instance_id"])
+    smith.relocate_git()
+    (Path(smith.TESTBED) / "calc.py").write_text("def add(:\n")
+    ev = smith.evaluate(task, 20)
+    assert ev.reward == 0.0
+    assert ev.resolved is False
+    assert ev.timed_out is False
+
+
+@pytest.mark.parametrize("host, expected_key", [("openrouter.ai", "router"), ("polza.ai", "polza")])
+def test_env_config_keeps_worker_credentials_separate(host, expected_key):
+    agent_cfg = base_agent_settings_dict()
+    agent_cfg["subagent"]["base_url"] = f"https://{host}/api/v1"
+    agent_cfg["subagent"]["reasoning"] = {"effort": "low"}
+    agent_cfg["oracle"]["models"] = ["test/small", "test/large"]
+    agent_cfg["oracle"]["learn"] = False
     with patch.dict(
         "os.environ",
         {
-            **agent_environment(),
-            "AGL_OPENAI_BASE_URL": "https://gateway.invalid/v1",
+            "ARBAS_AGENT_CONFIG": AgentSettings.model_validate(agent_cfg).model_dump_json(),
+            "AGL_OPENAI_BASE_URL": "https://gateway.invalid/mode/val/openai/v1",
             "AGL_KEY": "gateway",
             "OPENROUTER_API_KEY": "router",
-            "SUBAGENT_REASONING": '{"effort":"low"}',
-            "ORACLE_MODELS": '["test/small", "test/large"]',
-            "ORACLE_LEARN": "false",
+            "POLZA_API_KEY": "polza",
         },
         clear=True,
     ):
         config = load_config()
     assert config.orchestrator_api_key == "gateway"
-    assert config.subagent_api_key == "router"
-    assert config.subagent_model.reasoning == {"effort": "low"}
-    assert config.orchestrator_model.reasoning is None
-    assert config.oracle_models == ["test/small", "test/large"]
-    assert config.oracle_learn is False
+    assert config.subagent_api_key == expected_key
+    assert config.subagent.reasoning == {"effort": "low"}
+    assert config.orchestrator.reasoning is None
+    assert config.oracle.models == ["test/small", "test/large"]
+    assert config.oracle.learn is False
+    assert config.mode == "val"
+    config.orchestrator_base_url = "https://direct.invalid/v1"
+    assert config.mode == "inference"
+
+
+def test_polza_endpoint_requires_polza_key():
+    agent_cfg = base_agent_settings_dict()
+    agent_cfg["subagent"]["base_url"] = "https://polza.ai/api/v1"
+    env = {
+        "ARBAS_AGENT_CONFIG": AgentSettings.model_validate(agent_cfg).model_dump_json(),
+        "OPENROUTER_API_KEY": "router",
+    }
+    with patch.dict("os.environ", env, clear=True), pytest.raises(ValueError, match="Set POLZA_API_KEY"):
+        load_config()
+
+
+def test_build_agent_config_resolves_interpolations_and_overrides():
+    encoded = build_agent_config(
+        TRAINING_YAML,
+        "exp-1117-19",
+        config_overrides=[
+            "actor_rollout_ref.rollout.temperature=0.42",
+            "agents.orchestrator.max_turns=10",
+        ],
+    )
+    parsed = AgentSettings.model_validate_json(encoded)
+    assert parsed.orchestrator.temperature == 0.42
+    assert parsed.orchestrator.max_turns == 10
+    assert parsed.oracle.checkpoint == "/agl-logs/exp-1117-19/oracle/linucb.pkl"
 
 
 @pytest.mark.parametrize(
-    "name", ["SUBAGENT_MAX_STEPS", "SUBAGENT_MODEL", "SUBAGENT_MAX_TOKENS", "ORACLE_MODELS",
-             "SMITH_F2P_ONLY", "SMITH_MAX_TURNS"]
+    ("section", "field"),
+    [
+        ("subagent", "max_steps"),
+        ("subagent", "model"),
+        ("subagent", "max_tokens"),
+        ("oracle", "models"),
+        ("sandbox", "f2p_only"),
+        ("orchestrator", "max_turns"),
+    ],
 )
-def test_missing_agent_setting_fails_without_fallback(name):
-    settings = agent_environment()
-    del settings[name]
-    with patch.dict("os.environ", settings, clear=True), pytest.raises(ValueError, match=name):
-        load_config()
+def test_missing_agent_setting_fails_without_fallback(section, field):
+    agent_cfg = base_agent_settings_dict()
+    del agent_cfg[section][field]
+    with pytest.raises(ValidationError, match=field):
+        AgentSettings.model_validate(agent_cfg)
+
+
+def test_extra_agent_setting_is_rejected_fail_fast(tmp_path):
+    agent_cfg = base_agent_settings_dict()
+    agent_cfg["oracle"]["typo_field"] = 123
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        AgentSettings.model_validate(agent_cfg)
+
+    cfg = OmegaConf.to_container(load_experiment_config(TRAINING_YAML))
+    cfg["agents"]["subagent"]["typo_field"] = True
+    bad_yaml = tmp_path / "bad.yaml"
+    bad_yaml.write_text(OmegaConf.to_yaml(cfg))
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        build_agent_config(bad_yaml, "test-run")
 
 
 def test_training_reward_uses_yaml_penalty_settings(config):
     config.orchestrator_base_url = "https://gateway.invalid/mode/train/openai/v1"
-    result = TaskResult(agent_name="orchestrator", model="model", steps_taken=90,
-                        usage=TokenUsage(max_prompt_tokens=57000))
+    result = AgentRunResult(
+        agent_name="orchestrator",
+        model="model",
+        steps_taken=90,
+        usage=TokenUsage(max_prompt_tokens=57000),
+    )
     assert run.training_reward(1.0, True, result, config) == pytest.approx(0.9)
     assert run.training_reward(0.0, False, result, config) == 0.0
+    config.orchestrator_base_url = "https://gateway.invalid/mode/val/openai/v1"
+    assert run.training_reward(1.0, True, result, config) == 1.0
 
 
 def test_oracle_routes_each_assignment_then_learns_from_delayed_score(config, tmp_path):
-    config.oracle_models = ["test/small", "test/large"]
-    config.oracle_checkpoint = str(tmp_path / "router.pkl")
-    config.subagent_model.reasoning = {"effort": "low"}
+    config.oracle.models = ["test/small", "test/large"]
+    config.oracle.checkpoint = str(tmp_path / "router.pkl")
+    config.subagent.reasoning = {"effort": "low"}
     router = ModelRouter(config)
     root = Client(
         [
@@ -503,14 +674,15 @@ def test_oracle_routes_each_assignment_then_learns_from_delayed_score(config, tm
     )
     worker = Client([reply("Found"), reply("Fixed")])
     swarm = Orchestrator(config, root, worker, router).run("An original issue " * 800)
-    assert len(router.report()["decisions"]) == 2
-    assert len({d["program_id"] for d in router.report()["decisions"]}) == 2
-    assert [d["agent_name"] for d in router.report()["decisions"]] == ["fix_1", "fix_1"]
-    assert [d["model"] for d in router.report()["decisions"]] == [r.model for r in swarm.assignments]
+    decisions = router.report()["decisions"]
+    assert len(decisions) == 2
+    assert len({d["program_id"] for d in decisions}) == 2
+    assert [d["agent_name"] for d in decisions] == ["fix_1", "fix_1"]
+    assert [d["model"] for d in decisions] == [r.model for r in swarm.assignments]
     assert all(r["extra_body"] == {"reasoning": {"effort": "low"}} for r in worker.requests)
-    assert not np.array_equal(router.choices[0][0].features, router.choices[1][0].features)
+    assert decisions[0]["features"] != decisions[1]["features"]
     assert router.selector.n_update == 0
-    assert LinUCB.load(config.oracle_checkpoint).n_update == 0
+    assert LinUCB.load(config.oracle.checkpoint).n_update == 0
 
     router.feedback([1, 0], swarm.assignments)
     assert [d["score"] for d in router.report()["decisions"]] == [1, 0]
@@ -522,67 +694,69 @@ def test_oracle_routes_each_assignment_then_learns_from_delayed_score(config, tm
     np.testing.assert_array_equal(resumed.selector.A, router.selector.A)
     np.testing.assert_array_equal(resumed.selector.b, router.selector.b)
     expected_b = np.zeros_like(resumed.selector.b)
-    for ctx, d in router.choices:
-        expected_b[resumed.selector.index[d["model"]]] += d["reward"] * ctx.features
+    for x, d in router.choices:
+        expected_b[resumed.selector.index[d["model"]]] += d["reward"] * x
     np.testing.assert_allclose(resumed.selector.b, expected_b)
 
 
 @pytest.mark.parametrize("validation_url", [False, True])
 def test_oracle_frozen_evaluation_does_not_change_checkpoint(config, tmp_path, validation_url):
-    config.oracle_models = ["test/small", "test/large"]
-    config.oracle_checkpoint = str(tmp_path / "router.pkl")
-    LinUCB(config.oracle_models).save(config.oracle_checkpoint)
-    before = Path(config.oracle_checkpoint).read_bytes()
+    config.oracle.models = ["test/small", "test/large"]
+    config.oracle.checkpoint = str(tmp_path / "router.pkl")
+    LinUCB(config.oracle.models).save(config.oracle.checkpoint)
+    before = Path(config.oracle.checkpoint).read_bytes()
     if validation_url:
         config.orchestrator_base_url = "https://gateway.invalid/mode/val/rollout/1/v1"
     else:
-        config.oracle_learn = False
+        config.oracle.learn = False
     router = ModelRouter(config)
     spec = AgentSpec(name="fix_1", profile="fix", system_prompt="Fix")
-    settings = router.select("Issue", spec, TaskAssignment(agent_name=spec.name, prompt="Fix"), config.subagent_model)
-    router.feedback([1], [TaskResult(agent_name=spec.name, model=settings.model)])
+    settings = router.select("Issue", spec, TaskAssignment(agent_name=spec.name, prompt="Fix"), config.subagent)
+    router.feedback([1], [AssignmentResult(agent_name=spec.name, model=settings.model)])
     assert router.selector.n_update == 0
     assert router.report()["decisions"][0]["learned"] is False
-    assert Path(config.oracle_checkpoint).read_bytes() == before
-    assert not Path(config.oracle_checkpoint).with_suffix(".lock").exists()
+    assert Path(config.oracle.checkpoint).read_bytes() == before
+    assert not Path(config.oracle.checkpoint).with_suffix(".lock").exists()
 
 
 def test_oracle_shared_checkpoint_keeps_updates_from_other_episodes(config, tmp_path):
-    config.oracle_models = ["test/small", "test/large"]
-    config.oracle_checkpoint = str(tmp_path / "router.pkl")
+    config.oracle.models = ["test/small", "test/large"]
+    config.oracle.checkpoint = str(tmp_path / "router.pkl")
     routers = [ModelRouter(config) for _ in range(4)]
 
     def episode(router):
         spec = AgentSpec(name="fix_1", profile="fix", system_prompt="Fix")
-        settings = router.select("Issue", spec, TaskAssignment(agent_name=spec.name, prompt="Fix"), config.subagent_model)
-        result = TaskResult(agent_name=spec.name, model=settings.model, usage=TokenUsage(completion_tokens=100))
+        settings = router.select("Issue", spec, TaskAssignment(agent_name=spec.name, prompt="Fix"), config.subagent)
+        result = AssignmentResult(agent_name=spec.name, model=settings.model, usage=TokenUsage(completion_tokens=100))
         router.feedback([1], [result])
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(episode, routers))
-    learned = LinUCB.load(config.oracle_checkpoint)
+    learned = LinUCB.load(config.oracle.checkpoint)
     assert learned.n_select == 4
     assert learned.n_update == 4
     assert learned.pulls.sum() == 4
-    x = routers[0].choices[0][0].features
+    x = routers[0].choices[0][0]
     np.testing.assert_allclose(learned.A.sum(axis=0), 2 * np.eye(64) + 4 * np.outer(x, x))
     np.testing.assert_allclose(learned.b.sum(axis=0), 4 * (0.8 - 0.2 * 100 / 10000) * x)
 
 
 def test_oracle_rejects_checkpoint_from_another_model_pool(config, tmp_path):
-    config.oracle_checkpoint = str(tmp_path / "router.pkl")
-    LinUCB(["old/model"]).save(config.oracle_checkpoint)
-    config.oracle_models = ["test/small", "test/large"]
+    config.oracle.checkpoint = str(tmp_path / "router.pkl")
+    LinUCB(["old/model"]).save(config.oracle.checkpoint)
+    config.oracle.models = ["test/small", "test/large"]
     with pytest.raises(ValueError, match="checkpoint pool"):
         ModelRouter(config)
 
 
 @pytest.fixture
 def assignment_result():
-    return TaskResult(
+    return AssignmentResult(
         agent_name="worker_identity",
         model="worker_model_identity",
-        assignment=TaskAssignment(agent_name="worker_identity", prompt="Find the arithmetic bug", context="Look at calc"),
+        assignment=TaskAssignment(
+            agent_name="worker_identity", prompt="Find the arithmetic bug", context="Look at calc"
+        ),
         summary="Found subtraction instead of addition",
         status="completed",
         messages=[{"role": "tool", "content": "Command: cat calc.py\ndef add(a,b): return a-b"}],
@@ -637,18 +811,18 @@ def test_judge_receives_full_saved_observation(config, assignment_result):
 
 
 def test_oracle_skips_failed_judgments_but_updates_for_valid_zero(config, tmp_path):
-    config.oracle_models = ["test/small"]
-    config.oracle_checkpoint = str(tmp_path / "router.pkl")
+    config.oracle.models = ["test/small"]
+    config.oracle.checkpoint = str(tmp_path / "router.pkl")
     router = ModelRouter(config)
     spec = AgentSpec(name="fix_1", profile="fix", system_prompt="Fix")
     results = []
     for prompt in ["First", "Second", "Third"]:
         assignment = TaskAssignment(agent_name=spec.name, prompt=prompt)
-        settings = router.select("Issue", spec, assignment, config.subagent_model)
-        results.append(TaskResult(agent_name=spec.name, model=settings.model, assignment=assignment))
-    before = Path(config.oracle_checkpoint).read_bytes()
+        settings = router.select("Issue", spec, assignment, config.subagent)
+        results.append(AssignmentResult(agent_name=spec.name, model=settings.model, assignment=assignment))
+    before = Path(config.oracle.checkpoint).read_bytes()
     router.feedback([None, None, None], results)
-    assert Path(config.oracle_checkpoint).read_bytes() == before
+    assert Path(config.oracle.checkpoint).read_bytes() == before
     assert router.selector.n_update == 0
     router.feedback([1, None, 0], results)
     assert router.selector.n_update == 2
@@ -658,8 +832,8 @@ def test_oracle_skips_failed_judgments_but_updates_for_valid_zero(config, tmp_pa
 
 
 def test_assignment_patches_are_captured_before_later_workers_change_source(task, config, tmp_path):
-    config.oracle_models = ["test/small"]
-    config.oracle_checkpoint = str(tmp_path / "router.pkl")
+    config.oracle.models = ["test/small"]
+    config.oracle.checkpoint = str(tmp_path / "router.pkl")
     smith.checkout_bug_commit(task["instance_id"])
     smith.relocate_git()
     root = Client(
@@ -708,39 +882,37 @@ def test_http_comment_allowed_and_usage_handles_none():
     assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, usage.max_prompt_tokens) == (0, 7, 7, 0)
 
 
-def test_training_smoke_settings(tmp_path):
+def test_training_config_settings(tmp_path):
     pytest.importorskip("verl")
 
     from examples.swe_smith.train_smith_agent import DEFAULT_CONFIG, build_config
 
-    settings = load_training_config(DEFAULT_CONFIG)
+    settings = load_experiment_config(DEFAULT_CONFIG)
     config_path = tmp_path / "experiment.yaml"
     OmegaConf.save(settings, config_path)
-    config = build_config(config_path=config_path, smoke=True)
-    full = build_config(config_path=config_path)
+    config = build_config(config_path=config_path)
 
     assert config.actor_rollout_ref.model.path == settings.actor_rollout_ref.model.path
     assert config.actor_rollout_ref.model.lora_rank == settings.actor_rollout_ref.model.lora_rank
     assert config.actor_rollout_ref.model.lora.merge == settings.actor_rollout_ref.model.lora.merge
     assert config.actor_rollout_ref.rollout.n == settings.actor_rollout_ref.rollout.n
     assert config.actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend == "triton"
-    assert config.actor_rollout_ref.rollout.gpu_memory_utilization == settings.actor_rollout_ref.rollout.gpu_memory_utilization
+    assert (
+        config.actor_rollout_ref.rollout.gpu_memory_utilization
+        == settings.actor_rollout_ref.rollout.gpu_memory_utilization
+    )
     assert config.ray_kwargs.ray_init.address == "local"
-    assert full.actor_rollout_ref.model.path == settings.actor_rollout_ref.model.path
-    assert full.actor_rollout_ref.model.lora_rank == settings.actor_rollout_ref.model.lora_rank
-    assert full.actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend == "triton"
-    assert full.ray_kwargs.ray_init.address == "local"
-    assert config.trainer.total_training_steps == settings.trainer.total_training_steps
     assert config.trainer.logger == settings.trainer.logger
-    assert full.trainer.logger == settings.trainer.logger
     assert config.data.train_files == settings.data.train_files
     assert config.agentlightning.trace_aggregator.trajectory_max_response_length == config.data.max_response_length
     assert "agents" not in config
     assert "experiment" not in config
+    with pytest.raises(ValueError, match=r"rollout\.name=vllm"):
+        build_config(config_overrides=["actor_rollout_ref.rollout.name=sglang"])
     with pytest.raises(ValueError, match="gdn_prefill_backend=triton"):
         build_config(config_overrides=["actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend=flashinfer"])
     with pytest.raises(ValueError, match="local Ray"):
-        build_config(smoke=True, config_overrides=["ray_kwargs.ray_init.address=auto"])
+        build_config(config_overrides=["ray_kwargs.ray_init.address=auto"])
     with pytest.raises(ValueError, match="MAX_JOBS must be 1 or 2"):
         build_config(config_overrides=["ray_kwargs.ray_init.runtime_env.env_vars.MAX_JOBS=47"])
 
@@ -753,14 +925,19 @@ def test_prepare_ray_preserves_worker_defaults_and_checks_socket_path(monkeypatc
     defaults = {"VLLM_DISABLE_COMPILE_CACHE": "1", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"}
     monkeypatch.setattr("verl.trainer.constants_ppo.get_ppo_ray_runtime_env", lambda: {"env_vars": defaults})
     config = build_config(
-        config_overrides=["ray_kwargs.ray_init.runtime_env.env_vars.MAX_JOBS=1",
-                          "ray_kwargs.ray_init.runtime_env.env_vars.TEST_VAR=present"]
+        config_overrides=[
+            "ray_kwargs.ray_init.runtime_env.env_vars.MAX_JOBS=1",
+            "ray_kwargs.ray_init.runtime_env.env_vars.TEST_VAR=present",
+        ]
     )
     monkeypatch.setenv("RAY_TMPDIR", "/tmp/agl-ray")
     monkeypatch.setenv("VERL_WEIGHT_TRANSFER_IPC_DIR", "/tmp/agl-ipc-test")
     prepare_ray(config)
     assert dict(config.ray_kwargs.ray_init.runtime_env.env_vars) == {
-        **defaults, "MAX_JOBS": "1", "VLLM_USE_FLASHINFER_MOE_FP16": "0", "TEST_VAR": "present",
+        **defaults,
+        "MAX_JOBS": "1",
+        "VLLM_USE_FLASHINFER_MOE_FP16": "0",
+        "TEST_VAR": "present",
         "VERL_WEIGHT_TRANSFER_IPC_DIR": "/tmp/agl-ipc-test",
     }
 
@@ -772,11 +949,13 @@ def test_prepare_ray_preserves_worker_defaults_and_checks_socket_path(monkeypatc
 def test_extra_assignment_arguments_are_rejected(config):
     assignment_tool = next(tool for tool in ORCHESTRATOR_TOOLS if tool["function"]["name"] == "assign_task")
     assert assignment_tool["function"]["parameters"]["additionalProperties"] is False
-    root = Client([
-        reply(tool="create_subagent", arguments={"name": "fix"}),
-        reply(tool="assign_task", arguments={"agent": "fix_1", "prompt": "Fix", "prompt_2": "Lost instruction"}),
-        reply("Done"),
-    ])
+    root = Client(
+        [
+            reply(tool="create_subagent", arguments={"name": "fix"}),
+            reply(tool="assign_task", arguments={"agent": "fix_1", "prompt": "Fix", "prompt_2": "Lost instruction"}),
+            reply("Done"),
+        ]
+    )
     worker = Client([])
     result = Orchestrator(config, root, worker).run("Issue")
     assert not result.assignments
@@ -786,10 +965,10 @@ def test_extra_assignment_arguments_are_rejected(config):
 
 
 def test_budget_reserves_report_without_extra_request(config):
-    config.subagent_steps = 2
+    config.subagent.max_steps = 2
     client = Client([reply(tool="bash", arguments={"command": "printf evidence"}), reply("Found evidence; no fix yet")])
     worker = SubAgent(AgentSpec(name="research_1", profile="research", system_prompt="Research"), client, config)
-    result = worker.execute("Issue", TaskAssignment(agent_name="research_1", prompt="Find bug"), config.subagent_model)
+    result = worker.execute("Issue", TaskAssignment(agent_name="research_1", prompt="Find bug"), config.subagent)
     assert result.status == "step_limit"
     assert result.summary == "Found evidence; no fix yet"
     assert result.steps_taken == 2
@@ -798,12 +977,42 @@ def test_budget_reserves_report_without_extra_request(config):
 
 
 def test_final_report_does_not_execute_a_returned_tool_call(config):
-    config.subagent_steps = 2
-    client = Client([reply(tool="bash", arguments={"command": "printf first"}),
-                     reply(tool="bash", arguments={"command": "touch unexpected"})])
+    config.subagent.max_steps = 2
+    client = Client(
+        [
+            reply(tool="bash", arguments={"command": "printf first"}),
+            reply(tool="bash", arguments={"command": "touch unexpected"}),
+        ]
+    )
     worker = SubAgent(AgentSpec(name="fix_1", profile="fix", system_prompt="Fix"), client, config)
-    result = worker.execute("Issue", TaskAssignment(agent_name="fix_1", prompt="Fix"), config.subagent_model)
+    result = worker.execute("Issue", TaskAssignment(agent_name="fix_1", prompt="Fix"), config.subagent)
     assert result.status == "step_limit"
     assert result.tool_errors == {"unexpected_call": 1}
     assert "Tool call returned during final report" in result.summary
     assert not (Path(smith.TESTBED) / "unexpected").exists()
+
+
+def test_hierarchical_package_runs_standalone_as_in_k8s_pod(tmp_path):
+    import shutil
+    import sys
+
+    repo_root = Path(__file__).resolve().parents[2]
+    src = repo_root / "examples/swe_smith/hierarchical"
+    agl = tmp_path / "agl"
+    shutil.copytree(src, agl / "hierarchical", ignore=shutil.ignore_patterns("__pycache__"))
+    for py_file in (agl / "hierarchical").glob("*.py"):
+        assert "from datetime import UTC" not in py_file.read_text(encoding="utf-8")
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import sys; sys.path = [''] + [p for p in sys.path if p != {str(repo_root)!r}]; "
+            "import hierarchical.run; print(hierarchical.run.main.__name__)",
+        ],
+        cwd=agl,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert probe.stdout.strip() == "main"

@@ -1,0 +1,13 @@
+# Metadata from the exact CUDA wheels pinned above.
+# This lets uv resolve the environment before downloading the wheel payloads.
+[[dependency-metadata]]
+name = "flash-attn"
+version = "2.8.3+cu.12.9.torch.2.11"
+requires-python = ">=3.9"
+requires-dist = ["torch ==2.11.*", "einops"]
+
+[[dependency-metadata]]
+name = "causal-conv1d"
+version = "1.6.2.post1+cu.12.9.torch.2.11"
+requires-python = ">=3.9"
+requires-dist = ["torch ==2.11.*", "packaging", "ninja"]

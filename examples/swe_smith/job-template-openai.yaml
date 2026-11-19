@@ -38,6 +38,13 @@ spec:
                 secretKeyRef:
                   name: swe-smith-openrouter
                   key: api-key
+                  optional: true
+            - name: POLZA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: swe-smith-polza
+                  key: api-key
+                  optional: true
           resources:
             requests:
               cpu: "50m"

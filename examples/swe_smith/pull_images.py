@@ -20,8 +20,8 @@ import yaml
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 DEFAULT_DATASETS = (
-    EXAMPLE_DIR / "train_dataset_mixed.jsonl",
-    EXAMPLE_DIR / "val_dataset_filtered.jsonl",
+    EXAMPLE_DIR / "train.jsonl",
+    EXAMPLE_DIR / "val.jsonl",
 )
 ROLLOUT_IMAGE_TAG = "arbas"
 OPENAI_PACKAGE = "openai"

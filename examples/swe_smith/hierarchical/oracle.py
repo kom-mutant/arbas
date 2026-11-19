@@ -30,9 +30,9 @@ class HashingFeatures:
         for token in _TOKEN.findall(prompt.lower())[: self.max_tokens]:
             digest = int(hashlib.blake2b(token.encode(), digest_size=4).hexdigest(), 16)
             x[digest % (self.dim - 2)] += 1.0
-        x /= max(float(np.linalg.norm(x)), 1.0)
         x[-2] = min(len(prompt) / 4000.0, 1.0)
         x[-1] = 1.0
+        x /= max(float(np.linalg.norm(x)), 1.0)
         return x
 
 
@@ -173,7 +173,7 @@ class ModelRouter:
     ) -> ModelSettings:
         prompt = (
             f"Profile: {agent.profile}\nTask: {assignment.prompt}\n"
-            f"Context: {assignment.context}\nOriginal issue: {problem}"
+            f"Original issue: {problem[:1000]}\nContext: {assignment.context}"
         )
         features = self.features(prompt)
         if self.learn:

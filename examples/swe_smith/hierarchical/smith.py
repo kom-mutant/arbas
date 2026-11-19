@@ -155,6 +155,7 @@ def _agent_env() -> dict[str, str]:
         "AGL_KEY",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
+        "POLZA_API_KEY",
         "ORCHESTRATOR_API_KEY",
         "SUBAGENT_API_KEY",
         "JUDGE_API_KEY",
@@ -186,7 +187,7 @@ def _run(command: str, timeout: float) -> tuple[str, int]:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGKILL)
             stdout, stderr = proc.communicate()
-        output = stdout + stderr
+        output = (stdout or "") + (stderr or "")
         return (output + f"\n[timed out after {timeout}s]", 124) if timed_out else (output, proc.returncode)
     except Exception as exc:
         return f"[failed to start: {exc}]", 1

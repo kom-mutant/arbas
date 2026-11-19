@@ -172,6 +172,15 @@ def prepare_run(source: Path, root: Path, requested_name: str) -> tuple[Path, Di
     return run_dir, config
 
 
+def _scratch_dir() -> Path:
+    return Path(
+        os.environ.get("AGL_TMPDIR")
+        or os.environ.get("SLURM_JOB_SCRATCH")
+        or os.environ.get("TMPDIR")
+        or "/tmp"
+    ).expanduser()
+
+
 def warn_if_low_scratch(scratch_parent: Path) -> None:
     if not scratch_parent.is_dir():
         raise SystemExit(f"ERROR: temporary directory does not exist: {scratch_parent}")
@@ -240,7 +249,7 @@ def _supervise_training(
         signum: signal.signal(signum, request_stop) for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
     }
 
-    with TemporaryDirectory(prefix="agl-ipc-", dir="/tmp", ignore_cleanup_errors=True) as ipc_dir:
+    with TemporaryDirectory(prefix="agl-ipc-", dir=_scratch_dir(), ignore_cleanup_errors=True) as ipc_dir:
         proc_env = {**os.environ, **(trainer_env or {}), "VERL_WEIGHT_TRANSFER_IPC_DIR": ipc_dir}
         server_proc: subprocess.Popen[str] | None = None
         server_logger: threading.Thread | None = None
@@ -394,7 +403,7 @@ def run_train(role: str, target: str, config_source: Path) -> int:
     trainer_log = run_dir / f"{run_dir.name}-trainer.log"
     tensorboard_dir = Path(os.environ.get("TENSORBOARD_DIR") or (run_dir / "tensorboard"))
     tensorboard_dir.mkdir(parents=True, exist_ok=True)
-    scratch_parent = Path(os.environ.get("AGL_TMPDIR") or "/tmp")
+    scratch_parent = _scratch_dir()
     warn_if_low_scratch(scratch_parent)
 
     with TemporaryDirectory(prefix="agl-tmp.", dir=scratch_parent, ignore_cleanup_errors=True) as run_tmp:
@@ -450,14 +459,122 @@ def _prepare_remote_images(ssh_target: str, tunnel_control: Path | None, remote_
         pull_cmd.extend(["--image", str(image)])
     env = os.environ.copy()
     env.pop("OPENROUTER_API_KEY", None)
+    env.pop("POLZA_API_KEY", None)
     env.pop("AGL_KEY", None)
     subprocess.run(pull_cmd, check=True, env=env)
     return run_id
 
 
-def run_controller() -> int:
+def _openai_image_name(image: str) -> str:
+    if __package__:
+        from .pull_images import openai_image_name
+    else:
+        from pull_images import openai_image_name
+    return openai_image_name(image)
+
+
+def verify_container_health(agent_url: str, network: str, image: str) -> None:
+    probe_script = f"import urllib.request; urllib.request.urlopen('{agent_url}/healthz', timeout=5)"
+    probe_cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        network,
+        image,
+        "python",
+        "-c",
+        probe_script,
+    ]
+    print(f"Checking container network connectivity ({network} -> {agent_url}/healthz)...", flush=True)
+    try:
+        proc = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        raise SystemExit(
+            f"ERROR: container network check failed: {exc}\n"
+            f"Could not reach {agent_url}/healthz from inside container with --network={network}."
+        ) from exc
+    if proc.returncode != 0:
+        err = proc.stderr.strip() or proc.stdout.strip()
+        raise SystemExit(
+            f"ERROR: container cannot reach server at {agent_url}/healthz using network '{network}'.\n"
+            f"Output from container: {err}\n\n"
+            "In rootless Docker, --network=host attaches to RootlessKit's network namespace,\n"
+            "which has its own loopback. If the server is on the host loopback, 127.0.0.1 cannot\n"
+            "be reached via 127.0.0.1 from inside the container.\n\n"
+            "To fix this, specify how containers should reach the host:\n"
+            "- Set AGL_SERVER_AGENT_URL=http://10.0.2.2:<port> (for slirp4netns default gateway)\n"
+            "- Or set AGL_SERVER_AGENT_URL=http://<host-ip>:<port>\n"
+            "- Or configure AGL_DOCKER_NETWORK=<network_name>\n"
+            "See: https://docs.docker.com/engine/security/rootless/troubleshoot/#--nethost-doesnt-listen-ports-on-the-host-network-namespace"
+        )
+    print("Container network check passed.", flush=True)
+
+
+def run_controller(runner: str = "k8s") -> int:
     if not os.environ.get("AGL_KEY"):
         os.environ["AGL_KEY"] = "dummy"
+
+    output_root = Path(os.environ.get("AGL_OUTPUT_DIR") or (Path.cwd() / "outputs/swe-smith"))
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    if runner == "local":
+        port = os.environ.get("AGL_SERVER_PORT") or "8080"
+        public_host = os.environ.get("AGL_SERVER_PUBLIC_HOST") or "127.0.0.1"
+        server_url = f"http://{public_host}:{port}"
+        agent_url = os.environ.get("AGL_SERVER_AGENT_URL") or server_url
+        network = os.environ.get("AGL_DOCKER_NETWORK", "host")
+
+        for _ in range(10):
+            if healthy(server_url):
+                break
+            time.sleep(0.1)
+        if not healthy(server_url):
+            raise SystemExit(f"ERROR: server is not reachable at {server_url}.")
+
+        active_file = output_root / "active.json"
+        if active_file.is_file():
+            active = json.loads(active_file.read_text(encoding="utf-8"))
+            run_name = str(active["run_id"])
+            run_dir = output_root / run_name
+            run_dir.mkdir(parents=True, exist_ok=True)
+            if images := active.get("images"):
+                print("Preparing images for the current experiment", flush=True)
+                pull_cmd = [sys.executable, str(EXAMPLE_DIR / "pull_images.py")]
+                for img in images:
+                    pull_cmd.extend(["--image", str(img)])
+                env = os.environ.copy()
+                env.pop("OPENROUTER_API_KEY", None)
+                env.pop("AGL_KEY", None)
+                subprocess.run(pull_cmd, check=True, env=env)
+                test_image = _openai_image_name(str(images[0]))
+                verify_container_health(agent_url, network, test_image)
+        else:
+            run_dir = allocate_run_dir(output_root, "controller")
+            run_name = run_dir.name
+
+        os.environ["AGL_RUN_DIR"] = str(run_dir)
+        os.environ["AGL_RUN_NAME"] = run_name
+        controller_log = run_dir / f"{run_name}-controller.log"
+        print(f"Controller log: {controller_log}", flush=True)
+
+        return run_logged_command(
+            [
+                "agl-controller",
+                "runner_type=local",
+                f"agl_server.url={server_url}",
+                f"agl_server.agent_url={agent_url}",
+                "agl_server.key=${oc.env:AGL_KEY}",
+                "hydra.job_logging.root.level=WARNING",
+                f"local_runner.maximum_size={os.environ.get('AGL_MAX_LOCAL_JOBS', '32')}",
+                f"local_runner.poll_interval={os.environ.get('AGL_LOCAL_POLL_INTERVAL', '1')}",
+                "hydra.run.dir=${oc.env:AGL_RUN_DIR}",
+                "hydra.output_subdir=null",
+                "hydra.job_logging.root.handlers=[console]",
+            ],
+            controller_log,
+        )
+
     ssh_target = os.environ.get("SSH_TARGET") or os.environ.get("AGL_SSH_TARGET", "")
     port = os.environ.get("AGL_SERVER_PORT") or ("18080" if ssh_target else "8080")
     remote_port = os.environ.get("AGL_SSH_REMOTE_PORT") or "8080"
@@ -481,8 +598,6 @@ def run_controller() -> int:
     if remote_active and (not ssh_target or not remote_active.startswith("/")):
         raise SystemExit("ERROR: automatic image preparation needs SSH_TARGET and an absolute REMOTE_REPO_DIR.")
 
-    output_root = Path(os.environ.get("AGL_OUTPUT_DIR") or (Path.cwd() / "outputs/swe-smith"))
-    output_root.mkdir(parents=True, exist_ok=True)
     tunnel_dir: Path | None = None
     tunnel_control: Path | None = None
 
@@ -506,6 +621,10 @@ def run_controller() -> int:
                 ],
                 check=True,
             )
+            for _ in range(50):
+                if healthy(server_url):
+                    break
+                time.sleep(0.1)
 
         if not healthy(server_url):
             raise SystemExit(f"ERROR: server is not reachable at {server_url}.")
@@ -515,14 +634,15 @@ def run_controller() -> int:
             namespace,
             ["create", "configmap", "swe-smith-agent-scripts", f"--from-file={EXAMPLE_DIR / 'hierarchical'}"],
         )
-        if openrouter_key := os.environ.get("OPENROUTER_API_KEY"):
-            with TemporaryDirectory(prefix="arbas-secret.") as secret_dir:
-                secret_file = Path(secret_dir) / "api-key"
-                secret_file.write_text(openrouter_key, encoding="utf-8")
-                _kubectl_apply(
-                    namespace,
-                    ["create", "secret", "generic", "swe-smith-openrouter", f"--from-file=api-key={secret_file}"],
-                )
+        for provider in ("openrouter", "polza"):
+            if api_key := os.environ.get(f"{provider.upper()}_API_KEY"):
+                with TemporaryDirectory(prefix="arbas-secret.") as secret_dir:
+                    secret_file = Path(secret_dir) / "api-key"
+                    secret_file.write_text(api_key, encoding="utf-8")
+                    _kubectl_apply(
+                        namespace,
+                        ["create", "secret", "generic", f"swe-smith-{provider}", f"--from-file=api-key={secret_file}"],
+                    )
 
         if remote_active:
             run_name = _prepare_remote_images(ssh_target, tunnel_control, remote_active)
@@ -566,10 +686,27 @@ def run_controller() -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="run.sh",
-        description="Launch ARBAS training on GPU or K8s controller on Mac.",
+        description="Launch ARBAS training on GPU or controller.",
     )
     parser.add_argument("role", choices=["train", "server", "trainer", "controller"])
-    parser.add_argument("target", nargs="?", default="", help="Experiment name (train/server) or profile (controller)")
+    parser.add_argument(
+        "target",
+        nargs="?",
+        default="",
+        help="Experiment name (train/server) or runner/profile (controller)",
+    )
+    parser.add_argument(
+        "machine",
+        nargs="?",
+        default="",
+        help="Optional machine profile for controller (when target is a runner)",
+    )
+    parser.add_argument(
+        "--runner",
+        choices=["local", "k8s"],
+        default=None,
+        help="Controller runner mode (local or k8s)",
+    )
     parser.add_argument("--config", type=Path, default=None, help="Path to experiment YAML (default: training.yaml)")
     args = parser.parse_args(argv)
     if args.role == "trainer" and args.target:
@@ -580,7 +717,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.role == "controller":
-        return run_controller()
+        runner = args.runner or os.environ.get("AGL_RUNNER")
+        if not runner:
+            if args.target in ("local", "k8s"):
+                runner = args.target
+            else:
+                runner = "k8s"
+        return run_controller(runner=runner)
     env_cfg = os.environ.get("AGL_TRAIN_CONFIG")
     config_source = args.config or (Path(env_cfg) if env_cfg else DEFAULT_CONFIG)
     return run_train(args.role, args.target, config_source)

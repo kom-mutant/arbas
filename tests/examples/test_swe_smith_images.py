@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -65,35 +65,47 @@ class _FakeClient:
 
 
 def test_openai_image_name_matches_job_template_convention() -> None:
-    assert pull_images.openai_image_name("jyangballin/swesmith.foo") == ("jyangballin/swesmith.foo:arbas")
+    assert pull_images.openai_image_name("jyangballin/swesmith.foo") == "jyangballin/swesmith.foo:arbas"
 
 
 def test_image_limit_selects_the_same_distinct_instances_as_training() -> None:
-    rows = [{"instance_id": "a", "image_name": "image-a"},
-            {"instance_id": "a", "image_name": "duplicate"},
-            {"instance_id": "b", "image_name": "image-b"}]
+    rows = [
+        {"instance_id": "a", "image_name": "image-a"},
+        {"instance_id": "a", "image_name": "duplicate"},
+        {"instance_id": "b", "image_name": "image-b"},
+    ]
     assert pull_images.distinct_images(rows, 2) == ["image-a", "image-b"]
     with pytest.raises(ValueError, match="Need 3 distinct"):
         pull_images.distinct_images(rows, 3)
 
 
-@pytest.mark.parametrize("trainer, expected", [
-    ("val_before_train: false", ["repo/a"]),
-    ("val_before_train: false\n  test_freq: 1", ["repo/a", "repo/val"]),
-    ("test_freq: -1", ["repo/a", "repo/val"]),
-])
+@pytest.mark.parametrize(
+    ("trainer", "expected"),
+    [
+        ("val_before_train: false", ["repo/a"]),
+        ("val_before_train: false\n  test_freq: 1", ["repo/a", "repo/val"]),
+        ("test_freq: -1", ["repo/a", "repo/val"]),
+    ],
+)
 def test_list_images_from_experiment(tmp_path, monkeypatch, capsys, trainer, expected) -> None:
-    base_dir = tmp_path / "shared"
-    base_dir.mkdir()
-    (base_dir / "train.jsonl").write_text('\n'.join(json.dumps(row) for row in [
-        {"instance_id": "a", "image_name": "repo/a"},
-        {"instance_id": "b", "image_name": "repo/b"},
-    ]))
-    (base_dir / "base.yaml").write_text("data:\n  train_files: train.jsonl\n  max_train_instances: 2\n")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "train.jsonl").write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {"instance_id": "a", "image_name": "repo/a"},
+                {"instance_id": "b", "image_name": "repo/b"},
+            ]
+        )
+    )
     (tmp_path / "val.jsonl").write_text(json.dumps({"instance_id": "v", "image_name": "repo/val"}))
     config = tmp_path / "training.yaml"
     config.write_text(
-        "base: shared/base.yaml\ndata:\n  val_files: val.jsonl\n  max_train_instances: 1\n"
+        "data:\n"
+        "  train_files: data/train.jsonl\n"
+        "  val_files: val.jsonl\n"
+        "  max_train_instances: 1\n"
         f"trainer:\n  {trainer}\n"
     )
     monkeypatch.setattr(sys, "argv", ["pull_images.py", "--config", str(config), "--list"])

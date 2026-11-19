@@ -1,46 +1,133 @@
-base: training-base.yaml
-
 experiment:
   name: swe-smith-2b
 
 data:
-  train_files: train_dataset_mixed.jsonl
-  val_files: smoke_val.jsonl
+  train_files: train.jsonl
+  val_files: val.jsonl
   max_train_instances: 2
   train_batch_size: 1
   max_prompt_length: 16384
   max_response_length: 16384
+
+
+agents:
+  orchestrator:
+    model: auto
+    max_turns: 32
+    max_tokens: 4096
+    temperature: ${actor_rollout_ref.rollout.temperature}
+    reasoning: null
+
+  subagent:
+    base_url: https://polza.ai/api/v1
+    model: qwen/qwen3.5-9b
+    max_steps: 16
+    max_tokens: 4096
+    temperature: 0.7
+    reasoning: null
+
+  oracle:
+    models:
+      - google/gemma-4-26b-a4b-it
+      - qwen/qwen3.5-9b
+      - mistralai/mistral-small-3.2-24b-instruct
+    learn: true
+    feedback: semantic
+    cost_weight: 0.2
+    cost_ref: 10000
+    checkpoint: auto
+    seed: 0
+
+  judge:
+    base_url: ""
+    model: qwen/qwen3.5-9b
+    temperature: 0
+    max_tokens: 1024
+    reasoning: null
+
+  sandbox:
+    cmd_timeout: 120
+    eval_timeout: 600
+    api_timeout: 120
+    gateway_wait_s: 600
+    obs_char_cap: 6000
+    f2p_only: true
+
+  reward:
+    len_pen_t0: 80
+    len_pen_lambda: 0.1
+    prompt_pen_soft_start: 50000
+    prompt_pen_hard_cap: 64000
+    prompt_pen_max: 0.1
+
 
 actor_rollout_ref:
   model:
     path: Qwen/Qwen3.5-2B
     lora_rank: 32
     lora_alpha: 32
+    lora:
+      merge: true
+    use_fused_kernels: true
+
   rollout:
+    name: vllm
     n: 4
     max_model_len: 32768
     gpu_memory_utilization: 0.6
     enforce_eager: true
+    temperature: 1.0
+    val_kwargs:
+      temperature: 0.7
+    tensor_model_parallel_size: 1
+    log_prob_micro_batch_size_per_gpu: 1
+    engine_kwargs:
+      vllm:
+        enable_auto_tool_choice: true
+        moe_backend: triton
+        gdn_prefill_backend: triton
+    checkpoint_engine:
+      update_weights_bucket_megabytes: 4096
+
+  actor:
+    ppo_mini_batch_size: ${data.train_batch_size}
+    ppo_micro_batch_size_per_gpu: 1
+    optim:
+      lr: 1e-6
+    clip_ratio_high: 0.28
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+      entropy_from_logits_with_chunking: true
 
 trainer:
   n_gpus_per_node: 1
   total_epochs: 1
   val_before_train: false
   save_freq: 4
+  logger: [console, tensorboard]
+  project_name: arbas
 
-ray_kwargs:
-  ray_init:
-    num_cpus: 8
-    object_store_memory: 4294967296  # 4 GiB
+
+algorithm:
+  adv_estimator: grpo
 
 reward:
   num_workers: 2
 
-agents:
-  orchestrator:
-    max_turns: 32
-    max_tokens: 4096
-  subagent:
-    model: qwen/qwen3.5-9b
-    max_steps: 16
-    max_tokens: 4096
+ray_kwargs:
+  ray_init:
+    address: local
+    num_cpus: 8
+    object_store_memory: 4294967296  # 4 GiB
+    runtime_env:
+      env_vars:
+        MAX_JOBS: "2"
+        VLLM_USE_FLASHINFER_MOE_FP16: "0"
+
+agentlightning:
+  max_ppo_update_times: 2
+  trace_aggregator:
+    trajectory_max_prompt_length: ${data.max_prompt_length}
+    trajectory_max_response_length: ${data.max_response_length}
+    trajectory_max_total_length: ${actor_rollout_ref.rollout.max_model_len}

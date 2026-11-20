@@ -40,6 +40,7 @@ class SandboxSettings(BaseModel):
 class RewardSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    partial_credit: bool = False
     len_pen_t0: int = Field(ge=0)
     len_pen_lambda: float = Field(ge=0.0, le=1.0)
     prompt_pen_soft_start: int = Field(ge=0)

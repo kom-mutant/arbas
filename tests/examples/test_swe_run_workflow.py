@@ -971,3 +971,58 @@ def test_qwen35_chat_template_is_prefix_preserving():
     )
     assert no_think_p0.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
     assert no_think_p1.startswith(no_think_p0)
+
+
+def test_qwen35_chat_template_parameter_newline_handling():
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    env = ImmutableSandboxedEnvironment(trim_blocks=False, lstrip_blocks=False)
+    env.filters["tojson"] = lambda x: json.dumps(x, ensure_ascii=False)
+    env.filters["items"] = lambda d: list(d.items())
+    env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
+    template_path = Path(__file__).resolve().parents[2] / "examples/swe_smith/qwen35_chat_template.jinja"
+    tmpl = env.from_string(template_path.read_text(encoding="utf-8"))
+
+    msgs_trailing_nl = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"function": {"name": "bash", "arguments": {"command": "echo hello\n"}}}],
+        }
+    ]
+    rendered_trailing = tmpl.render(messages=msgs_trailing_nl, add_generation_prompt=False)
+    assert "<parameter=command>\necho hello\n</parameter>\n" in rendered_trailing
+    assert "<parameter=command>\necho hello\n\n</parameter>\n" not in rendered_trailing
+
+    msgs_no_nl = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"function": {"name": "bash", "arguments": {"command": "echo hello"}}}],
+        }
+    ]
+    rendered_no_nl = tmpl.render(messages=msgs_no_nl, add_generation_prompt=False)
+    assert "<parameter=command>\necho hello\n</parameter>\n" in rendered_no_nl
+
+    msgs_various_types = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "complex_tool",
+                        "arguments": {
+                            "crlf_cmd": "echo win\r\n",
+                            "count": 42,
+                            "options": {"verbose": True},
+                        },
+                    }
+                }
+            ],
+        }
+    ]
+    rendered_various = tmpl.render(messages=msgs_various_types, add_generation_prompt=False)
+    assert "<parameter=crlf_cmd>\necho win\r\n</parameter>\n" in rendered_various
+    assert "<parameter=count>\n42\n</parameter>\n" in rendered_various
+    assert '<parameter=options>\n{"verbose": true}\n</parameter>\n' in rendered_various

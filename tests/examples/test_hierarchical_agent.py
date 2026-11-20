@@ -653,10 +653,45 @@ def test_training_reward_uses_yaml_penalty_settings(config):
         steps_taken=90,
         usage=TokenUsage(max_prompt_tokens=57000),
     )
-    assert run.training_reward(1.0, True, result, config) == pytest.approx(0.9)
-    assert run.training_reward(0.0, False, result, config) == 0.0
+    solved = smith.Evaluation(1.0, True, "", False, 1.0)
+    unsolved = smith.Evaluation(0.0, False, "", False)
+    assert run.training_reward(solved, result, config) == pytest.approx(0.9)
+    assert run.training_reward(unsolved, result, config) == 0.0
     config.orchestrator_base_url = "https://gateway.invalid/mode/val/openai/v1"
-    assert run.training_reward(1.0, True, result, config) == 1.0
+    assert run.training_reward(solved, result, config) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("failure", "regression", "exit_code", "expected"),
+    [
+        ("FAILED", "PASSED", 1, 0.75),
+        ("FAILED", "FAILED", 1, 0.0),
+        ("ERROR", "PASSED", 1, 0.0),
+        ("FAILED", "PASSED", 124, 0.0),
+    ],
+)
+def test_partial_reward_requires_completed_tests_without_regressions(config, failure, regression, exit_code, expected):
+    fail_to_pass = [f"test_suite.py::test_fix_{i}" for i in range(4)]
+    pass_to_pass = "test_suite.py::test_existing"
+    output = "\n".join(
+        [f"PASSED {node}" for node in fail_to_pass[:3]]
+        + [f"{failure} {fail_to_pass[3]}", f"{regression} {pass_to_pass}"]
+    )
+    with (
+        patch.object(smith, "restore_f2p_tests"),
+        patch.object(smith, "_run", side_effect=[("", 1), (output, exit_code)]),
+    ):
+        evaluation = smith.evaluate({"FAIL_TO_PASS": fail_to_pass, "PASS_TO_PASS": [pass_to_pass]}, 20)
+
+    result = AgentRunResult(agent_name="orchestrator", model="model")
+    config.orchestrator_base_url = "https://gateway.invalid/mode/train/openai/v1"
+    assert evaluation.resolved is False
+    config.reward.partial_credit = False
+    assert run.training_reward(evaluation, result, config) == 0.0
+    config.reward.partial_credit = True
+    assert run.training_reward(evaluation, result, config) == expected
+    config.orchestrator_base_url = "https://gateway.invalid/mode/val/openai/v1"
+    assert run.training_reward(evaluation, result, config) == 0.0
 
 
 def test_oracle_routes_each_assignment_then_learns_from_delayed_score(config, tmp_path):
@@ -969,11 +1004,21 @@ def test_budget_reserves_report_without_extra_request(config):
     client = Client([reply(tool="bash", arguments={"command": "printf evidence"}), reply("Found evidence; no fix yet")])
     worker = SubAgent(AgentSpec(name="research_1", profile="research", system_prompt="Research"), client, config)
     result = worker.execute("Issue", TaskAssignment(agent_name="research_1", prompt="Find bug"), config.subagent)
-    assert result.status == "step_limit"
+    assert result.status == "completed"
     assert result.summary == "Found evidence; no fix yet"
     assert result.steps_taken == 2
     assert "tools" not in client.requests[-1]
     assert "evidence" in json.dumps(client.requests[-1]["messages"])
+
+
+def test_budget_reserves_report_empty_summary_sets_step_limit(config):
+    config.subagent.max_steps = 2
+    client = Client([reply(tool="bash", arguments={"command": "printf evidence"}), reply("")])
+    worker = SubAgent(AgentSpec(name="research_1", profile="research", system_prompt="Research"), client, config)
+    result = worker.execute("Issue", TaskAssignment(agent_name="research_1", prompt="Find bug"), config.subagent)
+    assert result.status == "step_limit"
+    assert "step limit reached" in result.summary
+    assert result.steps_taken == 2
 
 
 def test_final_report_does_not_execute_a_returned_tool_call(config):

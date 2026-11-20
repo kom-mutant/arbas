@@ -1,0 +1,12 @@
+-e .
+docker==7.2.0
+verl==0.8.0+arbas.2
+vllm @ https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/vllm-0.24.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl
+
+# CUDA kernels for the training model.
+causal-conv1d @ https://github.com/astral-sh-build/build-causal-conv1d/releases/download/v1.6.2.post1-r1/causal_conv1d-1.6.2.post1%2Bcu.12.9.torch.2.11-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl#sha256=ad3048244ca28fcbb8c797ac51447d5949838d8bfec41da93acb48f44497de99
+flash-attn @ https://github.com/astral-sh-build/build-flash-attention/releases/download/v2.8.3-r4/flash_attn-2.8.3%2Bcu.12.9.torch.2.11-cp312-cp312-manylinux_2_24_x86_64.whl#sha256=5a682548f167afc87a5e14118b1d528aaac8681487a11adda3129466a210d79a
+flash-linear-attention==0.6.0
+
+# TileLang needs the headers for its CUDA 13 compiler on Hopper.
+nvidia-cuda-cccl==13.2.86

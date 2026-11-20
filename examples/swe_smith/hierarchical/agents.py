@@ -167,7 +167,8 @@ class SubAgent:
                 _tool_error(result, "unrecognized_call")
                 result.messages.append({"role": "user", "content": TOOL_RETRY})
             elif (message.content or "").strip():
-                result.status, result.summary = ("step_limit" if reporting else "completed"), message.content
+                result.status = "completed"
+                result.summary = message.content
                 result.duration_s = time.perf_counter() - started
                 return result
             else:

@@ -4,7 +4,7 @@ experiment:
 data:
   train_files: train.jsonl
   val_files: val.jsonl
-  max_train_instances: 2
+  max_train_instances: 1
   train_batch_size: 1
   max_prompt_length: 16384
   max_response_length: 16384
@@ -13,7 +13,7 @@ data:
 agents:
   orchestrator:
     model: auto
-    max_turns: 32
+    max_turns: 24
     max_tokens: 4096
     temperature: ${actor_rollout_ref.rollout.temperature}
     reasoning: null
@@ -21,7 +21,7 @@ agents:
   subagent:
     base_url: https://polza.ai/api/v1
     model: qwen/qwen3.5-9b
-    max_steps: 16
+    max_steps: 12
     max_tokens: 4096
     temperature: 0.7
     reasoning: null
@@ -59,6 +59,7 @@ agents:
     prompt_pen_soft_start: 50000
     prompt_pen_hard_cap: 64000
     prompt_pen_max: 0.1
+    partial_credit: true
 
 
 actor_rollout_ref:
@@ -97,14 +98,14 @@ actor_rollout_ref:
     clip_ratio_high: 0.28
     fsdp_config:
       param_offload: true
-      optimizer_offload: true
+      optimizer_offload: false
       entropy_from_logits_with_chunking: true
 
 trainer:
   n_gpus_per_node: 1
   total_epochs: 1
   val_before_train: false
-  save_freq: 4
+  save_freq: 1
   logger: [console, tensorboard]
   project_name: arbas
 

@@ -220,11 +220,12 @@ def judge_assignments(
     return scores
 
 
-def training_reward(raw_reward: float, resolved: bool, result: AgentRunResult, config: Config) -> float:
+def training_reward(evaluation: smith.Evaluation, result: AgentRunResult, config: Config) -> float:
     if config.mode != "train":
-        return raw_reward
+        return evaluation.reward
 
     reward_cfg = config.reward
+    raw_reward = evaluation.partial_reward if reward_cfg.partial_credit else evaluation.reward
     reward = length_penalized_reward(
         raw_reward,
         result.steps_taken,
@@ -244,7 +245,7 @@ def training_reward(raw_reward: float, resolved: bool, result: AgentRunResult, c
         hard_cap=hard_cap,
         max_pen=reward_cfg.prompt_pen_max,
         is_train=True,
-        solved=resolved,
+        solved=evaluation.resolved,
     )
 
 
@@ -387,7 +388,7 @@ def main() -> int:
         eval_t0 = time.perf_counter()
         ev = smith.evaluate(eval_meta, config.sandbox.eval_timeout, f2p_only=config.sandbox.f2p_only)
         wall = time.perf_counter() - eval_t0
-        rew = training_reward(ev.reward, ev.resolved, swarm.orchestrator, config)
+        rew = training_reward(ev, swarm.orchestrator, config)
         return ev, wall, rew
 
     try:

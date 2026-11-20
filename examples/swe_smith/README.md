@@ -66,7 +66,16 @@ bash examples/swe_smith/run.sh controller h200
 
 ## Настройка окружения (`.env`)
 
-Подготовьте GPU-окружение скриптом `examples/swe_smith/setup_training.sh`.
+Подготовьте GPU-окружение командой `bash examples/swe_smith/setup_training.sh`.
+Скрипт создаёт `.venv` на Python 3.12 от `uv` и до установки пакетов проверяет
+наличие `Python.h`, который нужен Triton для компиляции. На Slurm `.venv` может
+быть симлинком на ваш каталог окружения.
+
+Прямые зависимости обучения перечислены в `requirements.in`. Установщик
+берёт версии всего дерева зависимостей из `requirements.txt`. После изменения
+прямых зависимостей пересоберите этот файл на Linux x86_64 командой
+`bash examples/swe_smith/setup_training.sh --lock`.
+
 На Mac нужны Docker Desktop, Kubernetes, `kubectl` и Python-окружение проекта
 (с пакетом `docker` для автоматической сборки `:arbas`-образов). Скрипт `run.sh`
 подхватывает активное виртуальное окружение или `.venv` в корне репозитория и

@@ -123,7 +123,11 @@
                         {{- '<parameter=' + args_name + '>\n' }}
                         {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}
                         {{- args_value }}
-                        {{- '\n</parameter>\n' }}
+                        {%- if args_value.endswith('\n') %}
+                            {{- '</parameter>\n' }}
+                        {%- else %}
+                            {{- '\n</parameter>\n' }}
+                        {%- endif %}
                     {%- endfor %}
                 {%- endif %}
                 {{- '</function>\n</tool_call>' }}

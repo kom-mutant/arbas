@@ -96,6 +96,7 @@ class Evaluation(NamedTuple):
     resolved: bool
     reason: str
     timed_out: bool
+    partial_reward: float = 0.0
 
 
 def render_observation(returncode: int, output: str, obs_cap: int) -> str:
@@ -347,13 +348,18 @@ def evaluate(eval_meta: dict[str, Any], timeout: int, f2p_only: bool = True) -> 
     )
     timed_out = rc == 124
     statuses = parse_test_statuses(output)
-    f2p_pass = [test for test in fail_to_pass if statuses.get(test) in ("PASSED", "XFAIL")]
-    p2p_ok = [test for test in pass_to_pass if statuses.get(test) in ("PASSED", "XFAIL")]
-    resolved = rc == 0 and len(f2p_pass) == len(fail_to_pass) and len(p2p_ok) == len(pass_to_pass)
+    f2p_pass = sum(statuses.get(test) in ("PASSED", "XFAIL") for test in fail_to_pass)
+    p2p_ok = sum(statuses.get(test) in ("PASSED", "XFAIL") for test in pass_to_pass)
+    resolved = rc == 0 and f2p_pass == len(fail_to_pass) and p2p_ok == len(pass_to_pass)
+    partial_reward = float(resolved)
+    if rc == 1 and p2p_ok == len(pass_to_pass):
+        f2p_failed = sum(statuses.get(test) == "FAILED" for test in fail_to_pass)
+        if f2p_failed and f2p_pass + f2p_failed == len(fail_to_pass):
+            partial_reward = f2p_pass / len(fail_to_pass)
     prefix = f"EVAL TIMEOUT after {timeout}s — " if timed_out else ""
     suffix = " (f2p_only)" if f2p_only else ""
     reason = (
-        f"{prefix}FAIL_TO_PASS {len(f2p_pass)}/{len(fail_to_pass)} passed, "
-        f"PASS_TO_PASS {len(p2p_ok)}/{len(pass_to_pass)} ok{suffix}"
+        f"{prefix}FAIL_TO_PASS {f2p_pass}/{len(fail_to_pass)} passed, "
+        f"PASS_TO_PASS {p2p_ok}/{len(pass_to_pass)} ok{suffix}"
     )
-    return Evaluation(1.0 if resolved else 0.0, resolved, reason, timed_out)
+    return Evaluation(float(resolved), resolved, reason, timed_out, partial_reward)

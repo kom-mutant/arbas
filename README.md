@@ -10,6 +10,8 @@
 
 > Agent Lightning was completely refactored in v1.0. For legacy releases earlier than v1.0, see [this branch](https://github.com/microsoft/agent-lightning/tree/v0.x).
 
+For ARBAS training and the Slurm launch workflow, see the [SWE-smith run guide](examples/swe_smith/README.md).
+
 ## ⚡ News
 
 - [2026/09] We release [a new coding agent example based on an MoE model](https://microsoft.github.io/agent-lightning/stable/76-example-coding-agent-moe/). Pure RL improves Qwen3.5-35B-A3B on SWE-bench Verified from 47.8% to 61.6% after training it on only 1.8K training examples!

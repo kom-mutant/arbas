@@ -2,22 +2,22 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import time
 from typing import TYPE_CHECKING, Any
 
 from openai import APIError, OpenAI, RateLimitError
 from pydantic import ValidationError
 
-from . import smith
 from .config import Config
 from .prompts import ORCHESTRATOR_PROMPT, PROFILE_PROMPTS, SUBAGENT_PROMPT
+from .sandbox import ContainerSandbox, render_observation
 from .types import (
     AgentRunResult,
     AgentSpec,
     AssignmentResult,
     AssignTaskArgs,
     BashArgs,
-    CreateSubagentArgs,
     ModelSettings,
     Profile,
     SwarmResult,
@@ -35,17 +35,15 @@ BASH_TOOL = {
         "parameters": BashArgs.model_json_schema(),
     },
 }
-ORCHESTRATOR_SCHEMAS = {
-    "create_subagent": (CreateSubagentArgs, "Create a worker from the expert catalog."),
-    "assign_task": (AssignTaskArgs, "Assign work and wait for the worker's report."),
+ASSIGN_TASK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "assign_task",
+        "description": "Assign one focused task to a research, fix, or verify worker and wait for its report.",
+        "parameters": AssignTaskArgs.model_json_schema(),
+    },
 }
-ORCHESTRATOR_TOOLS = [
-    {
-        "type": "function",
-        "function": {"name": name, "description": description, "parameters": schema.model_json_schema()},
-    }
-    for name, (schema, description) in ORCHESTRATOR_SCHEMAS.items()
-]
+ORCHESTRATOR_TOOLS = [ASSIGN_TASK_TOOL]
 TOOL_RETRY = "Your tool call could not be read. Retry one tool call with its required arguments."
 
 
@@ -104,11 +102,19 @@ def _unparsed_call(choice: Any, tool_names: tuple[str, ...]) -> bool:
     return bool(re.search(rf"(?m)(?:^|\s)(?:{names})\s*\(", visible))
 
 
+def _capture_optional_patch(sandbox: ContainerSandbox) -> str | None:
+    try:
+        return sandbox.capture_patch()
+    except (RuntimeError, subprocess.SubprocessError, OSError):
+        return None
+
+
 class SubAgent:
-    def __init__(self, spec: AgentSpec, client: OpenAI, config: Config) -> None:
+    def __init__(self, spec: AgentSpec, client: OpenAI, config: Config, sandbox: ContainerSandbox) -> None:
         self.spec = spec
         self.client = client
         self.config = config
+        self.sandbox = sandbox
 
     def execute(self, problem: str, assignment: TaskAssignment, settings: ModelSettings) -> AssignmentResult:
         started = time.perf_counter()
@@ -198,16 +204,10 @@ class SubAgent:
             _tool_reply(result, call, f"Invalid arguments: {exc}")
             return None
 
-        reason = smith._forbidden_action(args.command)
-        if reason:
-            output, rc = reason, 126
-        else:
-            output, rc = smith._run(args.command, self.config.sandbox.cmd_timeout)
+        output, rc = self.sandbox.run_bash(args.command, self.config.sandbox.cmd_timeout)
         if rc != 0:
             _tool_error(result, "command_failed")
-        observation = f"Command: {args.command}\n" + smith.render_observation(
-            rc, output, self.config.sandbox.obs_char_cap
-        )
+        observation = f"Command: {args.command}\n" + render_observation(rc, output, self.config.sandbox.obs_char_cap)
         _tool_reply(result, call, observation)
         return observation
 
@@ -218,34 +218,32 @@ class Orchestrator:
         config: Config,
         client: OpenAI,
         subagent_client: OpenAI,
+        sandbox: ContainerSandbox,
         router: ModelRouter | None = None,
     ) -> None:
         self.config = config
         self.client = client
         self.subagent_client = subagent_client
+        self.sandbox = sandbox
         self.router = router
-        self.agents: dict[str, SubAgent] = {}
         self.assignments: list[AssignmentResult] = []
 
-    def create_subagent(self, name: Profile) -> AgentSpec:
-        spec = AgentSpec(name=f"{name}_{len(self.agents) + 1}", profile=name, system_prompt=PROFILE_PROMPTS[name])
-        self.agents[spec.name] = SubAgent(spec, self.subagent_client, self.config)
-        return spec
-
-    def assign_task(self, agent: str, prompt: str, context: str = "") -> AssignmentResult:
-        worker = self.agents[agent]
-        assignment = TaskAssignment(agent_name=agent, prompt=prompt, context=context)
+    def assign_task(self, profile: Profile, prompt: str, context: str = "") -> AssignmentResult:
+        agent_name = f"{profile}_{len(self.assignments) + 1}"
+        spec = AgentSpec(name=agent_name, profile=profile, system_prompt=PROFILE_PROMPTS[profile])
+        worker = SubAgent(spec, self.subagent_client, self.config, self.sandbox)
+        assignment = TaskAssignment(agent_name=agent_name, prompt=prompt, context=context)
         settings = (
-            self.router.select(self.problem, worker.spec, assignment, self.config.subagent)
+            self.router.select(self.problem, spec, assignment, self.config.subagent)
             if self.router is not None
             else self.config.subagent
         )
         capture_evidence = self.router is not None and self.config.oracle.feedback == "semantic"
-        patch_before = smith.capture_patch() if capture_evidence else None
+        patch_before = _capture_optional_patch(self.sandbox) if capture_evidence else None
         result = worker.execute(self.problem, assignment, settings)
         if capture_evidence:
             result.patch_before = patch_before
-            result.patch_after = smith.capture_patch()
+            result.patch_after = _capture_optional_patch(self.sandbox)
         self.assignments.append(result)
         return result
 
@@ -280,7 +278,7 @@ class Orchestrator:
             message = choice.message
             if message.tool_calls:
                 self._execute_tool_calls(result, message.tool_calls)
-            elif _unparsed_call(choice, tuple(ORCHESTRATOR_SCHEMAS)):
+            elif _unparsed_call(choice, ("assign_task",)):
                 _tool_error(result, "unrecognized_call")
                 result.messages.append({"role": "user", "content": TOOL_RETRY})
             elif (message.content or "").strip():
@@ -301,29 +299,22 @@ class Orchestrator:
                 _tool_reply(result, call, "Call one tool at a time and read its result.")
             return
         call = calls[0]
-        if call.function.name not in ORCHESTRATOR_SCHEMAS:
+        if call.function.name != "assign_task":
             _tool_error(result, "unknown_tool")
-            _tool_reply(result, call, "Available tools: create_subagent and assign_task.")
+            _tool_reply(result, call, "Only assign_task is available.")
             return
         try:
-            args = ORCHESTRATOR_SCHEMAS[call.function.name][0].model_validate_json(call.function.arguments)
+            args = AssignTaskArgs.model_validate_json(call.function.arguments)
         except ValidationError as exc:
             _tool_error(result, "invalid_arguments")
             _tool_reply(result, call, f"Invalid arguments: {exc}")
             return
-        if isinstance(args, CreateSubagentArgs):
-            spec = self.create_subagent(args.name)
-            output: dict[str, Any] = {"agent_name": spec.name, "profile": spec.profile}
-        elif args.agent not in self.agents:
-            _tool_error(result, "unknown_agent")
-            available = ", ".join(self.agents) or "none yet"
-            output = {"error": f"Unknown agent {args.agent!r}. Use the exact agent_name. Available: {available}."}
-        else:
-            report = self.assign_task(args.agent, args.prompt, args.context)
-            output = {
-                "agent_name": report.agent_name,
-                "status": report.status,
-                "summary": report.summary,
-                "error": report.error,
-            }
+        report = self.assign_task(args.profile, args.prompt, args.context)
+        output = {
+            "agent_name": report.agent_name,
+            "profile": args.profile,
+            "status": report.status,
+            "summary": report.summary,
+            "error": report.error,
+        }
         _tool_reply(result, call, json.dumps(output, ensure_ascii=False))

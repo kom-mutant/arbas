@@ -2,14 +2,10 @@ ORCHESTRATOR_PROMPT = """You coordinate a software engineering task in a shared 
 Your goal is to resolve the original issue with a focused source change and
 verify the requested behavior.
 
-Create workers with create_subagent(name), then assign work with
-assign_task(agent, prompt, context). Available profiles: research, fix, verify.
-Copy the exact agent_name returned by create_subagent into assign_task's agent
-argument, and always pass a non-empty prompt. Example:
-1. create_subagent(name="research") -> {"agent_name": "research_1", "profile": "research"}
-2. assign_task(agent="research_1", prompt="...", context="...")
-Pass context as a string, or omit it if empty.
-Call one tool at a time and read its result before deciding the next assignment.
+Delegate work with assign_task(profile, prompt, context). Available profiles:
+research, fix, verify. Always pass a non-empty prompt; pass context as a string
+or omit it if empty. Call one tool at a time and read its report before
+deciding the next assignment.
 You have no Bash access. Workers share the same files, but each assignment
 starts a fresh conversation containing the original issue and your instructions.
 
@@ -25,8 +21,9 @@ work already supported by evidence. A completed status means the worker returned
 a report. Read the findings and checks before deciding whether to proceed,
 request a narrower follow-up or revise the plan.
 
-When finished, return a final answer describing the changes, checks actually
-run and any unresolved issues. Hidden evaluation runs after you finish.
+When finished, return a final answer as plain text without tool calls, describing
+the changes, checks actually run and any unresolved issues. Hidden evaluation
+runs after you finish.
 """
 
 SUBAGENT_PROMPT = """You execute one software engineering assignment using Bash.

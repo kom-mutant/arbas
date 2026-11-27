@@ -82,8 +82,6 @@ class _AglTaskRunner:
         self._delegate = TaskRunner()
 
     def run(self, config, train_dataset, val_dataset):
-        from pprint import pprint
-
         from omegaconf import OmegaConf
         from verl.trainer.main_ppo import (
             create_rl_sampler,
@@ -97,9 +95,14 @@ class _AglTaskRunner:
 
         from agentlightning.verl.trainer import AgentLightningRayPPOTrainer
 
-        print(f"AglTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
-        pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        rollout = config.actor_rollout_ref.rollout
+        print(
+            f"AglTaskRunner hostname={socket.gethostname()} pid={os.getpid()} "
+            f"model={config.actor_rollout_ref.model.path} "
+            f"mode={rollout.mode} n={rollout.n} "
+            f"agl={config.agentlightning.agl_base_url}"
+        )
 
         # Worker setup — delegated to verl's TaskRunner
         d = self._delegate

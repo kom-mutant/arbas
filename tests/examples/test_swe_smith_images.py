@@ -3,69 +3,33 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
 
 import pytest
 
 from examples.swe_smith import pull_images
 
 
-@dataclass
-class _FakeImage:
-    name: str
-
-    def tag(self, repository: str, tag: str) -> bool:
-        return True
-
-
-class _FakeImages:
-    def __init__(self, existing: set[str] | None = None) -> None:
+class _FakeDocker:
+    def __init__(self, existing: set[str] | None = None, *, pull_error: str | None = None) -> None:
         self.existing = set(existing or set())
-        self.pulled: list[str] = []
-        self.built: list[tuple[str, str, bool]] = []
+        self.pull_error = pull_error
+        self.calls: list[list[str]] = []
+        self.envs: list[dict[str, str] | None] = []
 
-    def get(self, image: str) -> _FakeImage:
-        if image not in self.existing:
-            raise KeyError(image)
-        fake = _FakeImage(image)
-
-        def tag(repository: str, tag: str) -> bool:
-            self.existing.add(f"{repository}:{tag}")
-            return True
-
-        fake.tag = tag  # type: ignore[method-assign]
-        return fake
-
-    def pull(self, image: str) -> _FakeImage:
-        self.pulled.append(image)
-        self.existing.add(image)
-        return _FakeImage(image)
-
-    def build(
-        self,
-        *,
-        path: str,
-        tag: str,
-        rm: bool,
-        forcerm: bool,
-        pull: bool,
-    ) -> tuple[_FakeImage, list[Any]]:
-        dockerfile = Path(path, "Dockerfile").read_text()
-        self.built.append((tag, dockerfile, pull))
-        self.existing.add(tag)
-        return _FakeImage(tag), []
-
-
-class _FakeClient:
-    def __init__(self, existing: set[str] | None = None) -> None:
-        self.images = _FakeImages(existing)
-
-
-def test_openai_image_name_matches_job_template_convention() -> None:
-    assert pull_images.openai_image_name("jyangballin/swesmith.foo") == "jyangballin/swesmith.foo:arbas"
+    def __call__(self, argv: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+        self.calls.append(argv)
+        self.envs.append(kwargs.get("env"))
+        if argv[:3] == ["docker", "image", "inspect"]:
+            rc = 0 if argv[3] in self.existing else 1
+            return subprocess.CompletedProcess(argv, rc, "", "")
+        if argv[:2] == ["docker", "pull"]:
+            if self.pull_error is not None:
+                return subprocess.CompletedProcess(argv, 1, "", self.pull_error)
+            self.existing.add(argv[2])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise AssertionError(f"Unexpected command: {argv}")
 
 
 def test_image_limit_selects_the_same_distinct_instances_as_training() -> None:
@@ -108,95 +72,100 @@ def test_list_images_from_experiment(tmp_path, monkeypatch, capsys, trainer, exp
         "  max_train_instances: 1\n"
         f"trainer:\n  {trainer}\n"
     )
-    monkeypatch.setattr(sys, "argv", ["pull_images.py", "--config", str(config), "--list"])
+    override_dir = tmp_path / "profiles"
+    override_dir.mkdir()
+    override = override_dir / "smoke.yaml"
+    override.write_text("base: ../training.yaml\ndata:\n  max_train_instances: 1\n")
+    monkeypatch.setattr(sys, "argv", ["pull_images.py", "--config", str(override), "--list"])
     pull_images.main()
     assert json.loads(capsys.readouterr().out) == expected
 
 
-def test_openai_image_name_rejects_already_tagged_sources() -> None:
-    with pytest.raises(ValueError, match="must be untagged"):
-        pull_images.openai_image_name("jyangballin/swesmith.foo:latest")
+def test_docker_calls_scrub_api_keys(monkeypatch) -> None:
+    fake = _FakeDocker()
+    monkeypatch.setattr(pull_images.subprocess, "run", fake)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret")
+    monkeypatch.setenv("POLZA_API_KEY", "polza-secret")
+    monkeypatch.setenv("AGL_KEY", "agl-secret")
+    monkeypatch.setenv("DOCKER_HOST", "unix:///tmp/custom.sock")
+
+    assert pull_images.prepare_one("repo/image", pull_missing=True) == pull_images.ImageResult("repo/image", "pulled")
+    assert len(fake.envs) == 2
+    for env in fake.envs:
+        assert env is not None
+        assert env["DOCKER_HOST"] == "unix:///tmp/custom.sock"
+        assert "OPENROUTER_API_KEY" not in env
+        assert "POLZA_API_KEY" not in env
+        assert "AGL_KEY" not in env
 
 
-def test_prepare_one_skips_when_openai_image_already_loaded() -> None:
-    client = _FakeClient({"repo/image:arbas"})
+def test_image_exists_uses_docker_image_inspect(monkeypatch) -> None:
+    fake = _FakeDocker({"repo/present"})
+    monkeypatch.setattr(pull_images.subprocess, "run", fake)
 
-    result = pull_images.prepare_one(
-        client,
-        "repo/image",
-        pull_missing=True,
-        force_build=False,
-    )
-
-    assert result.status == "exists"
-    assert client.images.pulled == []
-    assert client.images.built == []
+    assert pull_images.image_exists("repo/present") is True
+    assert pull_images.image_exists("repo/missing") is False
+    assert fake.calls == [
+        ["docker", "image", "inspect", "repo/present"],
+        ["docker", "image", "inspect", "repo/missing"],
+    ]
 
 
-def test_prepare_one_builds_openai_layer_from_local_base_without_pulling() -> None:
-    client = _FakeClient({"repo/image"})
+def test_prepare_one_skips_pull_when_base_image_already_exists(monkeypatch) -> None:
+    fake = _FakeDocker({"repo/image"})
+    monkeypatch.setattr(pull_images.subprocess, "run", fake)
 
-    result = pull_images.prepare_one(
-        client,
-        "repo/image",
-        pull_missing=True,
-        force_build=False,
-    )
+    result = pull_images.prepare_one("repo/image", pull_missing=True)
 
-    assert result.status == "base-local,built"
-    assert client.images.pulled == []
-    assert len(client.images.built) == 1
-    tag, dockerfile, pull = client.images.built[0]
-    assert tag == "repo/image:arbas"
-    assert "FROM repo/image" in dockerfile
-    assert "pip install --no-cache-dir openai" in dockerfile
-    assert "numpy>=1.23" in dockerfile
-    assert "COPY ORACLE" not in dockerfile
-    assert pull is False
+    assert result == pull_images.ImageResult("repo/image", "exists")
+    assert fake.calls == [["docker", "image", "inspect", "repo/image"]]
 
 
-def test_prepare_one_does_not_reuse_images_without_oracle_dependencies() -> None:
-    client = _FakeClient({"repo/image", "repo/image:openai", "repo/image:agl-openai"})
+def test_prepare_one_pulls_missing_base_image_when_allowed(monkeypatch) -> None:
+    fake = _FakeDocker()
+    monkeypatch.setattr(pull_images.subprocess, "run", fake)
 
-    result = pull_images.prepare_one(
-        client,
-        "repo/image",
-        pull_missing=False,
-        force_build=False,
-    )
+    result = pull_images.prepare_one("repo/image", pull_missing=True)
 
-    assert result.status == "base-local,built"
-    assert "repo/image:arbas" in client.images.existing
-    assert client.images.pulled == []
-    assert len(client.images.built) == 1
+    assert result == pull_images.ImageResult("repo/image", "pulled")
+    assert fake.calls == [
+        ["docker", "image", "inspect", "repo/image"],
+        ["docker", "pull", "repo/image"],
+    ]
 
 
-def test_prepare_one_pulls_missing_base_only_when_allowed() -> None:
-    client = _FakeClient()
+def test_prepare_one_can_require_preloaded_base_image(monkeypatch) -> None:
+    fake = _FakeDocker()
+    monkeypatch.setattr(pull_images.subprocess, "run", fake)
 
-    result = pull_images.prepare_one(
-        client,
-        "repo/image",
-        pull_missing=True,
-        force_build=False,
-    )
-
-    assert result.status == "base-pulled,built"
-    assert client.images.pulled == ["repo/image"]
-    assert client.images.built[0][0] == "repo/image:arbas"
-
-
-def test_prepare_one_can_require_preloaded_base_image() -> None:
-    client = _FakeClient()
-
-    result = pull_images.prepare_one(
-        client,
-        "repo/image",
-        pull_missing=False,
-        force_build=False,
-    )
+    result = pull_images.prepare_one("repo/image", pull_missing=False)
 
     assert result.status == "failed"
-    assert "base image is not loaded" in (result.error or "")
-    assert client.images.pulled == []
-    assert client.images.built == []
+    assert "image is not loaded" in (result.error or "")
+    assert fake.calls == [["docker", "image", "inspect", "repo/image"]]
+
+
+def test_prepare_one_reports_docker_pull_error(monkeypatch) -> None:
+    fake = _FakeDocker(pull_error="pull access denied")
+    monkeypatch.setattr(pull_images.subprocess, "run", fake)
+
+    result = pull_images.prepare_one("repo/image", pull_missing=True)
+
+    assert result == pull_images.ImageResult("repo/image", "failed", "pull access denied")
+
+
+def test_prepare_images_and_main_pull_unique_images_and_fail_on_error(monkeypatch, capsys) -> None:
+    fake = _FakeDocker({"repo/a"})
+    monkeypatch.setattr(pull_images.subprocess, "run", fake)
+
+    pull_images.prepare_images(["repo/a", "repo/b", "repo/a"])
+    out = capsys.readouterr().out
+    assert "EXISTS  repo/a" in out
+    assert "PULLED  repo/b" in out
+    assert "Prepared 2 SWE-smith images." in out
+    assert [c for c in fake.calls if c[1] == "pull"] == [["docker", "pull", "repo/b"]]
+
+    monkeypatch.setattr(pull_images.subprocess, "run", _FakeDocker(pull_error="network down"))
+    monkeypatch.setattr(sys, "argv", ["pull_images.py", "--image", "repo/missing"])
+    with pytest.raises(SystemExit, match="Failed to prepare SWE-smith images: repo/missing"):
+        pull_images.main()

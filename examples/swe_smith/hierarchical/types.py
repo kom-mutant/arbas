@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 Profile = Literal["research", "fix", "verify"]
 
@@ -86,18 +86,25 @@ class SwarmResult(BaseModel):
     assignments: list[AssignmentResult]
 
 
-class CreateSubagentArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: Profile
-
-
 class AssignTaskArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    agent: str
-    prompt: str = Field(min_length=1)
-    context: str = ""
+    profile: Profile = Field(description="Worker role: research, fix, or verify.")
+    prompt: str = Field(
+        min_length=1,
+        description="Required non-empty task instruction for the worker.",
+    )
+    context: str = Field(
+        default="",
+        description="Optional findings, file paths, or prior changes the worker needs.",
+    )
+
+    @field_validator("prompt")
+    @classmethod
+    def _require_non_blank_prompt(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("prompt must be a non-empty task instruction")
+        return value
 
 
 class BashArgs(BaseModel):

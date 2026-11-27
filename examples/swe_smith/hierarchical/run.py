@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-import http.client
 import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,25 +20,68 @@ from typing import Any
 from openai import APIError, OpenAI
 from pydantic import ValidationError
 
-from . import smith
 from .agents import Orchestrator
 from .config import Config, load_config
 from .oracle import ModelRouter
 from .prompts import JUDGE_PROMPT
+from .sandbox import ContainerSandbox, Evaluation, select_eval_nodes
 from .types import AgentRunResult, AssignmentResult, Judgment, SemanticScore, SwarmResult
 
 log = logging.getLogger(__name__)
 
 
-def post_event(event_type: str, data: dict[str, Any], retry: bool = False) -> None:
+@dataclass
+class EpisodeOutcome:
+    run_id: str | None
+    job_name: str
+    instance_id: str
+    repo: str
+    started_at: str
+    mode: str
+    submitted: bool = False
+    patch: str | None = None
+    patch_error: str | None = None
+    evaluation: Evaluation | None = None
+    reward: float | None = None
+    reward_published: bool = False
+    turns: int = 0
+    max_prompt_tokens: int = 0
+    judged_assignments: int = 0
+    timings_s: dict[str, float | None] = field(
+        default_factory=lambda: {"setup": None, "solve": None, "judge": None, "evaluation": None, "rollout_wall": None}
+    )
+
+    def metrics(self) -> dict[str, Any]:
+        ev = self.evaluation
+        return {
+            "run_id": self.run_id,
+            "started_at": self.started_at,
+            "job_name": self.job_name,
+            "instance_id": self.instance_id,
+            "reward": self.reward,
+            "raw_reward": ev.reward if ev is not None else None,
+            "reward_computed": self.reward is not None,
+            "reward_published": self.reward_published,
+            "resolved": ev.resolved if ev is not None else False,
+            "submitted": self.submitted,
+            "reason": ev.reason if ev is not None else "evaluation did not complete",
+            "eval_timeout": ev.timed_out if ev is not None else False,
+            "patch_error": self.patch_error,
+            "turns": self.turns,
+            "max_prompt_tokens": self.max_prompt_tokens,
+            "judged_assignments": self.judged_assignments,
+            "timings_s": self.timings_s,
+        }
+
+
+def post_event(event_type: str, data: dict[str, Any], retry: bool = False) -> bool:
     event_url = os.environ.get("AGL_EVENT_URL")
     if not event_url:
         log.warning("AGL_EVENT_URL not set; skip %s event", event_type)
-        return
+        return False
     body = json.dumps({"event_type": event_type, "data": data}).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    agl_key = os.environ.get("AGL_KEY") or os.environ.get("OPENAI_API_KEY")
-    if agl_key:
+    if agl_key := os.environ.get("AGL_KEY") or os.environ.get("OPENAI_API_KEY"):
         headers["Authorization"] = f"Bearer {agl_key}"
     request = urllib.request.Request(event_url, data=body, headers=headers, method="POST")
     attempts = 4 if retry else 1
@@ -43,99 +89,16 @@ def post_event(event_type: str, data: dict[str, Any], retry: bool = False) -> No
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 response.read()
-            return
+            return True
         except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
             fatal_http = isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500 and exc.code != 429
             if fatal_http or attempt == attempts:
                 log.warning("failed to post %s event: %s", event_type, exc)
-                return
+                return False
             backoff = 2**attempt
-            log.warning(
-                "failed to post %s event (attempt %d): %s; retrying in %ds",
-                event_type,
-                attempt,
-                exc,
-                backoff,
-            )
+            log.warning("failed to post %s event (attempt %d): %s; retrying in %ds", event_type, attempt, exc, backoff)
             time.sleep(backoff)
-
-
-def fetch_eval_meta() -> dict[str, Any]:
-    event_url = os.environ.get("AGL_EVENT_URL", "")
-    match = re.match(r"^(?P<base>.*)/api/rollouts/(?P<rid>[^/]+)/attempt/", event_url)
-    if not match:
-        log.error("cannot derive rollout id from AGL_EVENT_URL=%r; eval meta unavailable", event_url)
-        return {}
-    url = f"{match.group('base')}/api/rollouts/{match.group('rid')}"
-    headers: dict[str, str] = {}
-    agl_key = os.environ.get("AGL_KEY") or os.environ.get("OPENAI_API_KEY")
-    if agl_key:
-        headers["Authorization"] = f"Bearer {agl_key}"
-    request = urllib.request.Request(url, headers=headers, method="GET")
-    payload = None
-    attempts = 4
-    for i in range(attempts):
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            break
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            ConnectionError,
-            http.client.HTTPException,
-            json.JSONDecodeError,
-        ) as exc:
-            log.warning("fetch eval meta failed (attempt %d/%d): %s", i + 1, attempts, exc)
-            if i < attempts - 1:
-                time.sleep(min(2**i, 8))
-    if payload is None:
-        log.error("failed to fetch eval meta from server after %d attempts", attempts)
-        return {}
-    inp = (payload.get("rollout") or {}).get("input") or {}
-    return {
-        "instance_id": inp.get("instance_id", ""),
-        "repo": inp.get("repo", ""),
-        "FAIL_TO_PASS": inp.get("FAIL_TO_PASS", []),
-        "PASS_TO_PASS": inp.get("PASS_TO_PASS", []),
-    }
-
-
-def length_penalized_reward(
-    reward: float,
-    n_turns: int,
-    max_turns: int,
-    *,
-    t0: int,
-    lam: float,
-    is_train: bool,
-) -> float:
-    """Apply a linear turn penalty only to solved training rollouts."""
-    if not is_train or reward < 1.0 or n_turns <= t0:
-        return reward
-    span = max(1, max_turns - t0)
-    frac = min((n_turns - t0) / span, 1.0)
-    return 1.0 - lam * frac
-
-
-def prompt_length_penalty(
-    reward: float,
-    max_prompt_tokens: int,
-    *,
-    soft_start: int,
-    hard_cap: int,
-    max_pen: float,
-    is_train: bool,
-    solved: bool,
-) -> float:
-    """Apply a linear context-bloat penalty only to solved training rollouts."""
-    if not is_train or not solved or max_prompt_tokens <= soft_start:
-        return reward
-    if max_prompt_tokens >= hard_cap:
-        return reward - max_pen
-    span = max(1, hard_cap - soft_start)
-    frac = min((max_prompt_tokens - soft_start) / span, 1.0)
-    return reward - max_pen * frac
+    return False
 
 
 def judge_connection(config: Config) -> tuple[str, str]:
@@ -146,14 +109,13 @@ def judge_connection(config: Config) -> tuple[str, str]:
 def evaluate_assignment(client: OpenAI, problem: str, result: AssignmentResult, config: Config) -> Judgment:
     settings = config.judge
     judgment = Judgment(model=settings.model)
-    assignment = result.assignment
-    if assignment is None:
+    if result.assignment is None:
         judgment.error = "Missing task assignment metadata"
         return judgment
     evidence = {
         "original_issue": problem,
-        "assignment": assignment.prompt,
-        "context": assignment.context,
+        "assignment": result.assignment.prompt,
+        "context": result.assignment.context,
         "worker_instructions": "\n".join(m["content"] for m in result.messages if m["role"] == "system"),
         "report": result.summary,
         "command_observations": "\n\n".join(m["content"] for m in result.messages if m["role"] == "tool"),
@@ -214,245 +176,254 @@ def judge_assignments(
     ):
         futures = [executor.submit(evaluate_assignment, client, problem, result, config) for result in assignments]
         for result, future in zip(assignments, futures, strict=True):
-            judgment = future.result()
-            result.judgment = judgment
-            scores.append(judgment.score)
+            result.judgment = future.result()
+            scores.append(result.judgment.score)
     return scores
 
 
-def training_reward(evaluation: smith.Evaluation, result: AgentRunResult, config: Config) -> float:
+def training_reward(evaluation: Evaluation, result: AgentRunResult, config: Config) -> float:
+    """Compute scalar RL reward: optional partial F2P credit, minus turn and prompt-bloat penalties on solved tasks."""
     if config.mode != "train":
         return evaluation.reward
+    cfg = config.reward
+    reward = evaluation.partial_reward if cfg.partial_credit else evaluation.reward
+    if not evaluation.resolved:
+        return reward
 
-    reward_cfg = config.reward
-    raw_reward = evaluation.partial_reward if reward_cfg.partial_credit else evaluation.reward
-    reward = length_penalized_reward(
-        raw_reward,
-        result.steps_taken,
-        config.orchestrator.max_turns,
-        t0=reward_cfg.len_pen_t0,
-        lam=reward_cfg.len_pen_lambda,
-        is_train=True,
-    )
-    hard_cap = reward_cfg.prompt_pen_hard_cap
-    max_prompt_tokens = result.usage.max_prompt_tokens
-    if max_prompt_tokens >= hard_cap:
-        log.warning("max_prompt_tokens=%d >= hard_cap=%d (context near budget)", max_prompt_tokens, hard_cap)
-    return prompt_length_penalty(
-        reward,
-        max_prompt_tokens,
-        soft_start=reward_cfg.prompt_pen_soft_start,
-        hard_cap=hard_cap,
-        max_pen=reward_cfg.prompt_pen_max,
-        is_train=True,
-        solved=evaluation.resolved,
-    )
+    if result.steps_taken > cfg.len_pen_t0:
+        turn_frac = min(
+            (result.steps_taken - cfg.len_pen_t0) / max(1, config.orchestrator.max_turns - cfg.len_pen_t0),
+            1.0,
+        )
+        reward = 1.0 - cfg.len_pen_lambda * turn_frac
+
+    max_prompt = result.usage.max_prompt_tokens
+    if max_prompt >= cfg.prompt_pen_hard_cap:
+        log.warning("max_prompt_tokens=%d >= hard_cap=%d (context near budget)", max_prompt, cfg.prompt_pen_hard_cap)
+    if max_prompt > cfg.prompt_pen_soft_start:
+        prompt_frac = min(
+            (max_prompt - cfg.prompt_pen_soft_start) / max(1, cfg.prompt_pen_hard_cap - cfg.prompt_pen_soft_start),
+            1.0,
+        )
+        reward -= cfg.prompt_pen_max * prompt_frac
+    return reward
 
 
-def publish_result(
-    eval_meta: dict[str, Any],
-    patch: str,
-    submitted: bool,
-    evaluation: smith.Evaluation,
-    reward: float,
-    n_turns: int,
-    max_prompt_tokens: int,
-) -> None:
-    event_base = {"instance_id": eval_meta.get("instance_id", ""), "repo": eval_meta.get("repo", "")}
-    post_event("agent_output", {**event_base, "patch": patch, "patch_size": len(patch), "submitted": submitted})
+def publish_outcome(outcome: EpisodeOutcome) -> bool:
+    if outcome.evaluation is None or outcome.reward is None:
+        return False
+    base = {"instance_id": outcome.instance_id, "repo": outcome.repo}
+    patch_text = outcome.patch or ""
     post_event(
+        "agent_output",
+        {
+            **base,
+            "patch": patch_text,
+            "patch_size": len(patch_text),
+            "patch_error": outcome.patch_error,
+            "submitted": outcome.submitted,
+        },
+    )
+    delivered = post_event(
         "reward",
         {
-            **event_base,
-            "value": reward,
-            "raw_value": evaluation.reward,
-            "resolved": evaluation.resolved,
-            "reason": evaluation.reason,
-            "n_turns": n_turns,
-            "max_prompt_tokens": max_prompt_tokens,
-            "eval_timeout": evaluation.timed_out,
+            **base,
+            "value": outcome.reward,
+            "raw_value": outcome.evaluation.reward,
+            "resolved": outcome.evaluation.resolved,
+            "reason": outcome.evaluation.reason,
+            "n_turns": outcome.turns,
+            "max_prompt_tokens": outcome.max_prompt_tokens,
+            "eval_timeout": outcome.evaluation.timed_out,
             "source": "agent",
         },
         retry=True,
     )
+    return bool(delivered)
 
 
-def save_result(
-    *,
-    instance_id: str,
-    started_at: str,
-    patch: str,
-    submitted: bool,
-    evaluation: smith.Evaluation,
-    reward: float,
-    n_turns: int,
-    max_prompt_tokens: int,
-    judged_assignments: int,
-    timings: dict[str, float | None],
+def write_episode_file(
+    output_dir: Path,
+    outcome: EpisodeOutcome,
     config: Config,
-    swarm: SwarmResult,
+    swarm: SwarmResult | None,
     router: ModelRouter | None,
 ) -> Path:
-    output_dir = Path(os.environ.get("HIER_OUTPUT_DIR", "/tmp/hierarchical-smith"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / (instance_id.replace("/", "__") + ".json")
-    episode_metrics = {
-        "run_id": os.environ.get("AGL_RUN_NAME"),
-        "started_at": started_at,
-        "job_name": os.environ.get("AGL_ROLLOUT_JOB_NAME"),
-        "instance_id": instance_id,
-        "reward": reward,
-        "raw_reward": evaluation.reward,
-        "resolved": evaluation.resolved,
-        "submitted": submitted,
-        "reason": evaluation.reason,
-        "eval_timeout": evaluation.timed_out,
-        "turns": n_turns,
-        "max_prompt_tokens": max_prompt_tokens,
-        "assignment_count": len(swarm.assignments),
-        "judged_assignments": judged_assignments,
-        "timings_s": timings,
-    }
-    output = {
-        **episode_metrics,
-        "patch": patch,
+    output_path = output_dir / (outcome.instance_id.replace("/", "__") + ".json")
+    metrics = outcome.metrics()
+    metrics["assignment_count"] = len(swarm.assignments) if swarm is not None else 0
+    payload: dict[str, Any] = {
+        **metrics,
+        "patch": outcome.patch,
         "config": config.model_dump(exclude={"orchestrator_api_key", "subagent_api_key", "judge_api_key"}),
-        **swarm.model_dump(mode="json"),
     }
+    if swarm is not None:
+        payload.update(swarm.model_dump(mode="json"))
     if router is not None:
-        output["oracle"] = router.report()
-    output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
-    log.info("saved episode: %s (rollout_wall_s=%.2f)", output_path, timings["rollout_wall"])
-    log.info("episode_metrics=%s", json.dumps(episode_metrics, ensure_ascii=False))
+        payload["oracle"] = router.report()
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    log.info("saved episode: %s (rollout_wall=%.2fs)", output_path, outcome.timings_s["rollout_wall"])
+    log.info("episode_metrics=%s", json.dumps(metrics, ensure_ascii=False))
     return output_path
 
 
-def main() -> int:
+@contextmanager
+def _episode_log(path: Path) -> Iterator[None]:
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    stdout = logging.StreamHandler(sys.stdout)
+    stdout.setFormatter(formatter)
+    file = logging.FileHandler(path, encoding="utf-8")
+    file.setFormatter(formatter)
+    root = logging.getLogger()
+    previous_level = root.level
+    root.setLevel(logging.INFO)
+    root.addHandler(stdout)
+    root.addHandler(file)
+    try:
+        yield
+    finally:
+        root.removeHandler(stdout)
+        root.removeHandler(file)
+        file.close()
+        root.setLevel(previous_level)
+
+
+def _rollout_job_name() -> str:
+    rollout_id = os.environ.get("AGL_ROLLOUT_ID", "").strip()
+    attempt_id = os.environ.get("AGL_ATTEMPT_ID", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", rollout_id) or not re.fullmatch(r"[A-Za-z0-9._-]+", attempt_id):
+        raise ValueError("AGL_ROLLOUT_ID and AGL_ATTEMPT_ID are required and must be safe identifiers")
+    return f"agl-rollout-{rollout_id}-{attempt_id}"
+
+
+def main(sandbox: ContainerSandbox | None = None) -> None:
+    """Run one rollout on the host; only shell commands and pytest execute inside the container."""
+    run_dir = Path(os.environ["AGL_RUN_DIR"]).resolve()
+    job_name = _rollout_job_name()
+    output_dir = run_dir / "rollouts" / job_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with _episode_log(output_dir / f"{job_name}.log"):
+        _run_episode(run_dir, job_name, output_dir, sandbox)
+
+
+def _run_episode(run_dir: Path, job_name: str, output_dir: Path, sandbox: ContainerSandbox | None) -> None:
     started = time.perf_counter()
     started_at = datetime.now(timezone.utc).isoformat()  # noqa: UP017
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
 
     problem = os.environ.get("AGL_TASK_INPUT", "").strip()
     if not problem:
         raise SystemExit("AGL_TASK_INPUT (problem statement) not set")
-    eval_meta = json.loads(os.environ.get("AGL_EVAL_META", "") or "{}")
-    if not eval_meta:
-        eval_meta = fetch_eval_meta()
+    raw_eval_meta = os.environ.get("AGL_EVAL_META", "").strip()
+    if not raw_eval_meta:
+        raise SystemExit("AGL_EVAL_META not set")
+    eval_meta = json.loads(raw_eval_meta)
     instance_id = eval_meta.get("instance_id", "")
     if not instance_id:
-        raise SystemExit("eval meta unavailable: no instance_id (server fetch failed); aborting before rollout")
+        raise SystemExit("AGL_EVAL_META missing instance_id")
 
     config = load_config()
     oracle_cfg = config.oracle
+    if oracle_cfg.checkpoint == "auto":
+        oracle_cfg.checkpoint = str(run_dir / "oracle" / "linucb.pkl")
     judge_address = judge_connection(config) if oracle_cfg.models and oracle_cfg.feedback == "semantic" else None
     router = ModelRouter(config) if oracle_cfg.models else None
+    fail_to_pass, pass_to_pass = select_eval_nodes(eval_meta, f2p_only=config.sandbox.f2p_only)
 
-    log.info("SmithAgent start: instance=%s max_turns=%d", instance_id, config.orchestrator.max_turns)
-    smith.checkout_bug_commit(instance_id)
-    smith.relocate_git()
-    solve_started = time.perf_counter()
-    with (
-        OpenAI(
-            base_url=config.orchestrator_base_url,
-            api_key=config.orchestrator_api_key,
-            timeout=config.sandbox.api_timeout,
-            max_retries=3,
-        ) as client,
-        OpenAI(
-            base_url=config.subagent.base_url,
-            api_key=config.subagent_api_key,
-            timeout=config.sandbox.api_timeout,
-            max_retries=3,
-        ) as subagent_client,
-    ):
-        swarm = Orchestrator(config, client, subagent_client, router=router).run(problem)
-    solve_wall_s = time.perf_counter() - solve_started
-
-    submitted = swarm.orchestrator.status == "completed"
-    n_turns = swarm.orchestrator.steps_taken
-    max_prompt_tokens = swarm.orchestrator.usage.max_prompt_tokens
-    patch = smith.capture_patch()
-
-    evaluation: smith.Evaluation | None = None
-    reward = 0.0
-    scores: list[float | None] = []
-    judge_wall_s: float | None = None
-    evaluation_wall_s: float | None = None
-    judged_assignments = 0
-
-    def _run_evaluation() -> tuple[smith.Evaluation, float, float]:
-        eval_t0 = time.perf_counter()
-        ev = smith.evaluate(eval_meta, config.sandbox.eval_timeout, f2p_only=config.sandbox.f2p_only)
-        wall = time.perf_counter() - eval_t0
-        rew = training_reward(ev, swarm.orchestrator, config)
-        return ev, wall, rew
+    swarm: SwarmResult | None = None
+    outcome = EpisodeOutcome(
+        run_id=os.environ.get("AGL_RUN_NAME"),
+        job_name=job_name,
+        instance_id=instance_id,
+        repo=eval_meta.get("repo", ""),
+        started_at=started_at,
+        mode=config.mode,
+    )
+    container: AbstractContextManager[ContainerSandbox] = (
+        nullcontext(sandbox)
+        if sandbox is not None
+        else ContainerSandbox(
+            os.environ["IMAGE_NAME"],
+            job_name,
+            run_dir=run_dir,
+            cpus=config.sandbox.cpus,
+            memory=config.sandbox.memory,
+            ttl_seconds=max(config.sandbox.eval_timeout + 3600, 7200),
+        )
+    )
 
     try:
+        log.info("SmithAgent start: instance=%s max_turns=%d", instance_id, config.orchestrator.max_turns)
+        with container as box:
+            box.setup(instance_id, fail_to_pass + pass_to_pass)
+            solve_started = time.perf_counter()
+            outcome.timings_s["setup"] = solve_started - started
+            with (
+                OpenAI(
+                    base_url=config.orchestrator_base_url,
+                    api_key=config.orchestrator_api_key,
+                    timeout=config.sandbox.api_timeout,
+                    max_retries=3,
+                ) as client,
+                OpenAI(
+                    base_url=config.subagent.base_url,
+                    api_key=config.subagent_api_key,
+                    timeout=config.sandbox.api_timeout,
+                    max_retries=3,
+                ) as subagent_client,
+            ):
+                swarm = Orchestrator(config, client, subagent_client, box, router=router).run(problem)
+            outcome.timings_s["solve"] = time.perf_counter() - solve_started
+            outcome.submitted = swarm.orchestrator.status == "completed"
+            outcome.turns = swarm.orchestrator.steps_taken
+            outcome.max_prompt_tokens = swarm.orchestrator.usage.max_prompt_tokens
+
+            try:
+                outcome.patch = box.capture_patch()
+            except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
+                outcome.patch_error = str(exc)
+                log.error("patch capture failed: %s", exc)
+
+            eval_started = time.perf_counter()
+            outcome.evaluation = box.evaluate(eval_meta, config.sandbox.eval_timeout, f2p_only=config.sandbox.f2p_only)
+            outcome.timings_s["evaluation"] = time.perf_counter() - eval_started
+
+        outcome.reward = training_reward(outcome.evaluation, swarm.orchestrator, config)
+
+        scores: list[float | None] = []
         if judge_address is not None and swarm.assignments:
             judge_started = time.perf_counter()
             scores = judge_assignments(problem, swarm.assignments, config, judge_address)
-            judge_wall_s = time.perf_counter() - judge_started
-            judged_assignments = sum(score is not None for score in scores)
+            outcome.timings_s["judge"] = time.perf_counter() - judge_started
+            outcome.judged_assignments = sum(score is not None for score in scores)
             log.info(
                 "Judge stage: assignments=%d scored=%d wall_s=%.2f",
                 len(scores),
-                judged_assignments,
-                judge_wall_s,
+                outcome.judged_assignments,
+                outcome.timings_s["judge"],
             )
-
-        evaluation, evaluation_wall_s, reward = _run_evaluation()
-
         if router is not None:
             if oracle_cfg.feedback == "episode":
-                scores = [evaluation.reward] * len(swarm.assignments)
+                scores = [outcome.evaluation.reward] * len(swarm.assignments)
             router.feedback(scores, swarm.assignments)
     finally:
-        try:
-            if evaluation is None:
-                evaluation, evaluation_wall_s, reward = _run_evaluation()
-            log.info(
-                "done: mode=%s submitted=%s patch=%dB reward=%.3f raw_reward=%.3f "
-                "n_turns=%d max_prompt_tokens=%d reason=%s",
-                config.mode,
-                submitted,
-                len(patch),
-                reward,
-                evaluation.reward,
-                n_turns,
-                max_prompt_tokens,
-                evaluation.reason,
-            )
-            publish_result(eval_meta, patch, submitted, evaluation, reward, n_turns, max_prompt_tokens)
-        finally:
-            eval_result = evaluation or smith.Evaluation(0.0, False, "evaluation failed", False)
-            timings: dict[str, float | None] = {
-                "setup": solve_started - started,
-                "solve": solve_wall_s,
-                "judge": judge_wall_s,
-                "evaluation": evaluation_wall_s,
-                "rollout_wall": time.perf_counter() - started,
-            }
-            save_result(
-                instance_id=instance_id,
-                started_at=started_at,
-                patch=patch,
-                submitted=submitted,
-                evaluation=eval_result,
-                reward=reward,
-                n_turns=n_turns,
-                max_prompt_tokens=max_prompt_tokens,
-                judged_assignments=judged_assignments,
-                timings=timings,
-                config=config,
-                swarm=swarm,
-                router=router,
-            )
-    return 0
+        outcome.timings_s["rollout_wall"] = time.perf_counter() - started
+        outcome.reward_published = publish_outcome(outcome)
+        log.info(
+            "done: mode=%s submitted=%s patch=%s patch_error=%s reward=%s published=%s turns=%d reason=%s",
+            outcome.mode,
+            outcome.submitted,
+            f"{len(outcome.patch)}B" if outcome.patch is not None else "error",
+            bool(outcome.patch_error),
+            f"{outcome.reward:.3f}" if outcome.reward is not None else "none",
+            outcome.reward_published,
+            outcome.turns,
+            outcome.evaluation.reason if outcome.evaluation is not None else "incomplete",
+        )
+        write_episode_file(output_dir, outcome, config, swarm, router)
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+class RolloutWorker:
+    """Entrypoint that ``LocalReconciler`` instantiates for every rollout."""
+
+    def run(self) -> None:
+        main()

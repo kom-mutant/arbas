@@ -1,5 +1,3 @@
-# Metadata from the exact CUDA wheels pinned above.
-# This lets uv resolve the environment before downloading the wheel payloads.
 [[dependency-metadata]]
 name = "flash-attn"
 version = "2.8.3+cu.12.9.torch.2.11"

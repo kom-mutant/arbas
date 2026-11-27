@@ -550,6 +550,7 @@ class AglRolloutManager(AglRolloutManagerBase):
         num_deleted = 0
         num_succeeded = 0
         num_failed = 0
+        last_progress: tuple[int, int, int] | None = None
 
         while len(completed_rollouts) < len(enqueued_rollouts):
             # Delete prior completions before polling to bound server-side state.
@@ -575,10 +576,13 @@ class AglRolloutManager(AglRolloutManagerBase):
 
                 completed_rollouts.append(self._build_completed_rollout(enqueued_rollout, rollout))
 
-            print(
-                f"AglRolloutManager: completed={len(completed_rollouts)}/{len(enqueued_rollouts)} "
-                f"succeeded={num_succeeded} failed={num_failed}"
-            )
+            progress = (len(completed_rollouts), num_succeeded, num_failed)
+            if progress != last_progress:
+                print(
+                    f"AglRolloutManager: completed={len(completed_rollouts)}/{len(enqueued_rollouts)} "
+                    f"succeeded={num_succeeded} failed={num_failed}"
+                )
+                last_progress = progress
 
             if pending_rollouts:
                 time.sleep(self._poll_interval_seconds)
@@ -621,6 +625,7 @@ class AglAsyncRolloutManager(AglRolloutManagerBase):
         completed_rollouts: list[CompletedRollout] = []
         num_succeeded = 0
         num_failed = 0
+        last_progress: tuple[int, int, int, int] | None = None
 
         while len(completed_group_keys) < target_finished_group_num:
             for data_id, group in grouped_rollouts.items():
@@ -661,11 +666,14 @@ class AglAsyncRolloutManager(AglRolloutManagerBase):
                     if len(completed_group_keys) >= target_finished_group_num:
                         break
 
-            print(
-                f"AglAsyncRolloutManager: completed_groups={len(completed_group_keys)}/{target_finished_group_num} "
-                f"finished_rollouts={len(finished_rollout_ids)}/{len(active_rollouts)} "
-                f"succeeded={num_succeeded} failed={num_failed}"
-            )
+            progress = (len(completed_group_keys), len(finished_rollout_ids), num_succeeded, num_failed)
+            if progress != last_progress:
+                print(
+                    f"AglAsyncRolloutManager: completed_groups={len(completed_group_keys)}/{target_finished_group_num} "
+                    f"finished_rollouts={len(finished_rollout_ids)}/{len(active_rollouts)} "
+                    f"succeeded={num_succeeded} failed={num_failed}"
+                )
+                last_progress = progress
 
             if len(completed_group_keys) < target_finished_group_num:
                 time.sleep(self._poll_interval_seconds)

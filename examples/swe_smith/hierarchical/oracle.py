@@ -3,8 +3,10 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import math
+import os
 import pickle
 import re
+import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -99,6 +101,10 @@ class LinUCB:
         self.pulls[choice] += 1
         return self.models[choice]
 
+    def record_selection(self, model: str) -> None:
+        self.n_select += 1
+        self.pulls[self.index[model]] += 1
+
     def update(self, features: np.ndarray, model: str, reward: float) -> None:
         self.n_update += 1
         j = self.index[model]
@@ -160,9 +166,20 @@ class ModelRouter:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.selector = self._load()
             yield self.selector
-            temporary = self.checkpoint.with_suffix(".tmp")
-            self.selector.save(temporary)
-            temporary.replace(self.checkpoint)
+            self._save()
+
+    def _save(self) -> None:
+        # Readers never see a partial file: write to a unique sibling, then atomically replace.
+        fd, temporary = tempfile.mkstemp(dir=self.checkpoint.parent, prefix=f".{self.checkpoint.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as file:
+                pickle.dump(self.selector, file)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, self.checkpoint)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
 
     def select(
         self,
@@ -176,11 +193,7 @@ class ModelRouter:
             f"Original issue: {problem[:1000]}\nContext: {assignment.context}"
         )
         features = self.features(prompt)
-        if self.learn:
-            with self._training_state() as selector:
-                model = selector.select(features)
-        else:
-            model = self.selector.select(features)
+        model = self.selector.select(features)
         decision: dict[str, Any] = {
             "program_id": f"{self.episode_id}:{len(self.choices)}",
             "agent_name": agent.name,
@@ -207,7 +220,10 @@ class ModelRouter:
         if not self.learn or not scored:
             return
 
+        # One locked read-modify-write per episode merges this episode into whatever others have learned.
         with self._training_state() as selector:
+            for _, decision in self.choices:
+                selector.record_selection(decision["model"])
             for features, decision in scored:
                 selector.update(features, decision["model"], decision["reward"])
                 decision["learned"] = True

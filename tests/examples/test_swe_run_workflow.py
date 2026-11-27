@@ -1,23 +1,34 @@
+from __future__ import annotations
+
+import http.server
 import json
 import os
 import re
 import shlex
+import shutil
+import signal
 import socket
 import subprocess
 import sys
+import threading
+import time
 from collections import namedtuple
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import yaml
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
-from agentlightning.controller.k8s_reconciler import build_job_spec
-from agentlightning.schemas import Rollout, RolloutConfig, RolloutK8sConfig, RolloutLifecycleStatus
 from examples.swe_smith import launch
 from examples.swe_smith.hierarchical.config import AgentSettings, load_config
-from examples.swe_smith.train_smith_agent import build_agent_config, load_experiment_config, load_split_file
+from examples.swe_smith.train_smith_agent import (
+    build_agent_config,
+    load_experiment_config,
+    load_split_file,
+    resolve_experiment,
+)
 
 CONFIG = Path(__file__).resolve().parents[2] / "examples/swe_smith/training.yaml"
 
@@ -29,23 +40,92 @@ def _free_port() -> int:
 
 
 def _executable(path: Path, contents: str) -> None:
-    path.write_text("#!/bin/sh\nset -eu\n" + contents + "\n")
+    path.write_text("#!/bin/sh\nset -eu\n" + contents + "\n", encoding="utf-8")
     path.chmod(0o755)
 
 
-def test_settings_reach_agent_and_real_controller_template(tmp_path):
+def _write_experiment(
+    directory: Path, *, max_train_instances: int | None = 1, rollout_overrides: dict | None = None
+) -> Path:
+    cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    for split in ("train", "val"):
+        dataset = CONFIG.parent / f"{split}.jsonl"
+        (directory / dataset.name).write_bytes(dataset.read_bytes())
+        cfg["data"][f"{split}_files"] = dataset.name
+    if max_train_instances is not None:
+        cfg["data"]["max_train_instances"] = max_train_instances
+    if rollout_overrides:
+        cfg["actor_rollout_ref"]["rollout"].update(rollout_overrides)
+    cfg_path = directory / "experiment.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    return cfg_path
+
+
+@contextmanager
+def _health_server(port: int):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _install_fake_docker(bin_dir: Path) -> None:
+    _executable(
+        bin_dir / "docker",
+        'printf "%s\\n" "$*" >> "$MOCK_DOCKER_LOG"\n'
+        'case "$1 $2" in\n'
+        '  "image inspect")\n'
+        '    env | grep -qE "^(OPENROUTER_API_KEY|POLZA_API_KEY|AGL_KEY)=" && exit 99 || true\n'
+        '    printf "%s\\n" "$3" >> "$MOCK_IMAGES_LOG"\n'
+        "    exit 1;;\n"
+        '  "pull "*)\n'
+        '    env | grep -qE "^(OPENROUTER_API_KEY|POLZA_API_KEY|AGL_KEY)=" && exit 99 || true\n'
+        '    printf "%s\\n" "$2" >> "$MOCK_PULLED_LOG"\n'
+        "    exit 0;;\n"
+        '  "ps "*)\n'
+        "    exit 0;;\n"
+        "esac\n"
+        "exit 0",
+    )
+
+
+def _stage_run_sh(tmp_path: Path, python_script: str) -> Path:
+    repo = tmp_path / "staged-repo"
+    script_dir = repo / "examples/swe_smith"
+    venv_bin = repo / ".venv/bin"
+    script_dir.mkdir(parents=True)
+    venv_bin.mkdir(parents=True)
+    shutil.copy2(CONFIG.parent / "run.sh", script_dir / "run.sh")
+    _executable(venv_bin / "python", python_script)
+    return repo
+
+
+def test_settings_reach_agent_config_and_survive_arrow_serialization(tmp_path):
+    pa = pytest.importorskip("pyarrow")
     source = OmegaConf.to_container(load_experiment_config(CONFIG))
     source["agents"]["orchestrator"]["max_turns"] = 12
     source["agents"]["subagent"]["max_steps"] = 24
     source["agents"]["orchestrator"]["max_tokens"] = 3072
     source["agents"]["oracle"]["models"] = ["test/model-a", "test/model-b"]
-    source["agents"]["oracle"]["checkpoint"] = "/custom/oracle.pkl"
+    source["agents"]["oracle"]["checkpoint"] = "auto"
     source["agents"]["subagent"]["model"] = "literal {{ example }}"
     source["actor_rollout_ref"]["rollout"]["temperature"] = 0.55
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(source))
+    config_path.write_text(yaml.safe_dump(source), encoding="utf-8")
 
-    agent_config_json = build_agent_config(config_path, "test-run")
+    agent_config_json = build_agent_config(config_path)
     with patch.dict(
         os.environ,
         {
@@ -62,64 +142,9 @@ def test_settings_reach_agent_and_real_controller_template(tmp_path):
     assert config.orchestrator.max_tokens == 3072
     assert config.orchestrator.temperature == 0.55
     assert config.oracle.models == ["test/model-a", "test/model-b"]
+    assert config.oracle.checkpoint == "auto"
     assert config.sandbox.f2p_only is True
     assert config.judge.reasoning is None
-
-    template = (CONFIG.parent / "job-template-openai.yaml").read_text()
-    dataset = load_split_file(
-        str(CONFIG.parent / "train.jsonl"),
-        agent_config_json=agent_config_json,
-        run_name="test-run",
-    )
-    rollout = Rollout(
-        rollout_id="test-id",
-        input=dataset[0],
-        config=RolloutConfig(k8s=RolloutK8sConfig(job_template=template)),
-        status=RolloutLifecycleStatus(created_at=1.0, updated_at=1.0),
-    )
-    controller = OmegaConf.create(
-        {
-            "agl_server": {"url": "http://server:8080", "key": "agl-secret"},
-            "k8s_runner": {"namespace": "default", "ttl_after_finished": 60},
-        }
-    )
-    job = build_job_spec(rollout, controller)
-    container = job["spec"]["template"]["spec"]["containers"][0]
-    assert f"$AGL_RUN_NAME-{job['metadata']['name']}.log" in container["args"][0]
-    volumes = {item["name"]: item for item in job["spec"]["template"]["spec"]["volumes"]}
-    assert volumes["agent-scripts"]["configMap"]["name"] == "swe-smith-agent-scripts"
-    assert "oracle-scripts" not in volumes
-    assert volumes["rollout-logs"]["hostPath"]["path"] == "/agl-logs"
-    assert {mount["name"]: mount["mountPath"] for mount in container["volumeMounts"]} == {
-        "agent-scripts": "/agl/hierarchical",
-        "rollout-logs": "/agl-logs",
-    }
-    env = {item["name"]: item for item in container["env"]}
-    parsed_env_cfg = AgentSettings.model_validate_json(env["ARBAS_AGENT_CONFIG"]["value"])
-    assert parsed_env_cfg.subagent.model == "literal {{ example }}"
-    assert parsed_env_cfg.subagent.max_steps == 24
-    assert parsed_env_cfg.oracle.checkpoint == "/custom/oracle.pkl"
-    assert env["AGL_RUN_NAME"]["value"] == "test-run"
-    assert env["AGL_KEY"]["value"] == "agl-secret"
-    for provider in ("polza", "openrouter"):
-        assert env[f"{provider.upper()}_API_KEY"]["valueFrom"]["secretKeyRef"] == {
-            "name": f"swe-smith-{provider}",
-            "key": "api-key",
-            "optional": True,
-        }
-
-
-def test_dataset_settings_survive_arrow_serialization(tmp_path):
-    pa = pytest.importorskip("pyarrow")
-    source = OmegaConf.to_container(load_experiment_config(CONFIG))
-    source["agents"]["oracle"]["models"] = ["test/model-a", "test/model-b"]
-    source["agents"]["oracle"]["checkpoint"] = "auto"
-    config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(source))
-
-    agent_config_json = build_agent_config(config_path, "test-run")
-    parsed = AgentSettings.model_validate_json(agent_config_json)
-    assert parsed.oracle.checkpoint == "/agl-logs/test-run/oracle/linucb.pkl"
 
     rows = load_split_file(
         str(CONFIG.parent / "train.jsonl"),
@@ -129,6 +154,26 @@ def test_dataset_settings_survive_arrow_serialization(tmp_path):
     restored = pa.Table.from_pylist(rows).to_pylist()
     assert restored[0]["arbas_agent_config"] == agent_config_json
     assert restored[0]["agl_run_name"] == "test-run"
+    eval_meta = json.loads(restored[0]["eval_meta"])
+    assert eval_meta["instance_id"] == restored[0]["instance_id"]
+    assert isinstance(eval_meta["FAIL_TO_PASS"], list)
+
+
+def test_build_config_targets_host_rollout_worker_without_k8s():
+    pytest.importorskip("verl")
+    from examples.swe_smith.train_smith_agent import build_config
+
+    cfg = build_config(config_path=CONFIG, run_name="test-run")
+    assert cfg.agentlightning.local.agent_class == "examples.swe_smith.hierarchical.run:RolloutWorker"
+    assert cfg.agentlightning.k8s.job_template_path is None
+    assert dict(cfg.agentlightning.local.env_map) == {
+        "IMAGE_NAME": "input.image_name",
+        "AGL_TASK_INPUT": "input.problem_statement",
+        "AGL_EVAL_META": "input.eval_meta",
+        "ARBAS_AGENT_CONFIG": "input.arbas_agent_config",
+        "AGL_RUN_NAME": "input.agl_run_name",
+        "DATA_ID": "input.data_id",
+    }
 
 
 def test_allocate_run_dir_uses_mmdd_hh_and_collision_suffix(tmp_path):
@@ -179,18 +224,36 @@ def test_scratch_dir_respects_slurm_hierarchy(monkeypatch, tmp_path):
     assert launch._scratch_dir() == d_agl
 
 
-def test_run_sh_binds_hf_home_on_slurm(tmp_path):
-    root = CONFIG.parents[2]
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _executable(
-        bin_dir / "python",
-        'printf "%s\\n" "$HF_HOME" > "$MOCK_PY_ENV"\n',
+def test_run_sh_overrides_foreign_virtualenv_and_binds_hf_home_on_slurm(tmp_path):
+    real_root = CONFIG.parents[2]
+    interpreter = shlex.quote(sys.executable)
+    staged = _stage_run_sh(
+        tmp_path,
+        f"PYTHONPATH={shlex.quote(str(real_root))} exec {interpreter} -c '\n"
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from unittest.mock import patch\n"
+        "from examples.swe_smith import launch\n"
+        "def _dump(*a, **kw):\n"
+        '    Path(os.environ["MOCK_PY_ENV"]).write_text(\n'
+        '        os.environ["VIRTUAL_ENV"] + "|" + os.environ["HF_HOME"]\n'
+        "    )\n"
+        "    return 0\n"
+        'with patch.object(launch, "run_train", side_effect=_dump):\n'
+        "    raise SystemExit(launch.main(sys.argv[4:]))\n"
+        '\' "$@"\n',
     )
+    foreign_bin = tmp_path / "foreign-venv/bin"
+    foreign_bin.mkdir(parents=True)
+    _executable(foreign_bin / "python", "exit 99")
+
+    config_home = tmp_path / "home"
+    config_home.mkdir()
     env = {
         **os.environ,
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "VIRTUAL_ENV": sys.prefix,
+        "HOME": str(config_home),
+        "PATH": f"{foreign_bin}{os.pathsep}{os.environ['PATH']}",
+        "VIRTUAL_ENV": str(foreign_bin.parent),
         "MOCK_PY_ENV": str(tmp_path / "env"),
         "SLURM_CACHE_DIR": "/scratch/cache/alice",
         "HF_HOME": "/old/stale/path",
@@ -199,35 +262,52 @@ def test_run_sh_binds_hf_home_on_slurm(tmp_path):
 
     res = subprocess.run(
         ["bash", "examples/swe_smith/run.sh", "train", "exp", "--config", "custom.yaml"],
-        cwd=root,
+        cwd=staged,
         env=env,
         capture_output=True,
         text=True,
         timeout=10,
     )
     assert res.returncode == 0, res.stdout + res.stderr
-    assert (tmp_path / "env").read_text().strip() == "/scratch/cache/alice/huggingface"
+    assert (tmp_path / "env").read_text(encoding="utf-8").strip() == (
+        f"{staged.resolve() / '.venv'}|/scratch/cache/alice/huggingface"
+    )
 
 
 def test_run_sh_loads_profile_preserves_cuda_and_execs_launcher(tmp_path):
-    root = CONFIG.parents[2]
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _executable(
-        bin_dir / "python",
-        'printf "%s\\n" "$@" > "$MOCK_PY_ARGS"\n'
-        'printf "%s|%s|%s\\n" "$CUDA_VISIBLE_DEVICES" "${AGL_KEY:-}" "${SSH_TARGET:-}" > "$MOCK_PY_ENV"',
+    real_root = CONFIG.parents[2]
+    interpreter = shlex.quote(sys.executable)
+    staged = _stage_run_sh(
+        tmp_path,
+        f"PYTHONPATH={shlex.quote(str(real_root))} exec {interpreter} -c '\n"
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from unittest.mock import patch\n"
+        "from examples.swe_smith import launch\n"
+        'Path(os.environ["MOCK_PY_ARGS"]).write_text("\\n".join(sys.argv[1:]) + "\\n")\n'
+        "def _dump(*a, **kw):\n"
+        "    vals = [\n"
+        '        os.environ.get("CUDA_VISIBLE_DEVICES", ""),\n'
+        '        os.environ.get("AGL_KEY", ""),\n'
+        '        os.environ.get("SSH_TARGET", ""),\n'
+        "    ]\n"
+        '    Path(os.environ["MOCK_PY_ENV"]).write_text("|".join(vals) + "\\n")\n'
+        "    return 0\n"
+        "with (\n"
+        '    patch.object(launch, "run_train", side_effect=_dump),\n'
+        '    patch.object(launch, "run_worker", side_effect=_dump),\n'
+        "):\n"
+        "    raise SystemExit(launch.main(sys.argv[4:]))\n"
+        '\' "$@"\n',
     )
     config_home = tmp_path / "home"
     arbas_dir = config_home / ".config/arbas"
     arbas_dir.mkdir(parents=True)
-    (arbas_dir / "machine.env").write_text("AGL_KEY=train-key\nCUDA_VISIBLE_DEVICES=0,1\n")
-    (arbas_dir / "ipavlov.env").write_text("SSH_TARGET=ipavlov-a100\nAGL_KEY=ctrl-key\n")
+    (arbas_dir / "machine.env").write_text("AGL_KEY=train-key\nCUDA_VISIBLE_DEVICES=0,1\n", encoding="utf-8")
+    (arbas_dir / "ipavlov.env").write_text("SSH_TARGET=ipavlov-a100\nAGL_KEY=ctrl-key\n", encoding="utf-8")
     env = {
         **os.environ,
         "HOME": str(config_home),
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "VIRTUAL_ENV": sys.prefix,
         "CUDA_VISIBLE_DEVICES": "5",
         "MOCK_PY_ARGS": str(tmp_path / "args"),
         "MOCK_PY_ENV": str(tmp_path / "env"),
@@ -236,14 +316,14 @@ def test_run_sh_loads_profile_preserves_cuda_and_execs_launcher(tmp_path):
 
     res = subprocess.run(
         ["bash", "examples/swe_smith/run.sh", "train", "exp", "--config", "custom.yaml"],
-        cwd=root,
+        cwd=staged,
         env=env,
         capture_output=True,
         text=True,
         timeout=10,
     )
     assert res.returncode == 0, res.stdout + res.stderr
-    assert (tmp_path / "args").read_text().splitlines() == [
+    assert (tmp_path / "args").read_text(encoding="utf-8").splitlines() == [
         "-u",
         "-m",
         "examples.swe_smith.launch",
@@ -252,22 +332,33 @@ def test_run_sh_loads_profile_preserves_cuda_and_execs_launcher(tmp_path):
         "--config",
         "custom.yaml",
     ]
-    assert (tmp_path / "env").read_text().strip() == "5|train-key|"
+    assert (tmp_path / "env").read_text(encoding="utf-8").strip() == "5|train-key|"
 
     res2 = subprocess.run(
-        ["bash", "examples/swe_smith/run.sh", "controller", "ipavlov"],
-        cwd=root,
+        ["bash", "examples/swe_smith/run.sh", "worker", "ipavlov"],
+        cwd=staged,
         env=env,
         capture_output=True,
         text=True,
         timeout=10,
     )
     assert res2.returncode == 0, res2.stdout + res2.stderr
-    assert (tmp_path / "env").read_text().strip() == "5|ctrl-key|ipavlov-a100"
+    assert (tmp_path / "env").read_text(encoding="utf-8").strip() == "5|ctrl-key|ipavlov-a100"
+
+    res3 = subprocess.run(
+        ["bash", "examples/swe_smith/run.sh", "train", "exp", "--profile", "ipavlov"],
+        cwd=staged,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert res3.returncode == 0, res3.stdout + res3.stderr
+    assert (tmp_path / "env").read_text(encoding="utf-8").strip() == "5|ctrl-key|ipavlov-a100"
 
 
 @pytest.mark.parametrize(("include_routed_experts", "trainer_status"), [(False, 0), (True, 7)])
-def test_train_launches_both_processes_with_named_logs(
+def test_remote_train_launches_gateway_and_trainer_with_named_logs(
     tmp_path, monkeypatch, capsys, include_routed_experts, trainer_status
 ):
     bin_dir = tmp_path / "bin"
@@ -277,17 +368,16 @@ def test_train_launches_both_processes_with_named_logs(
 
     _executable(
         bin_dir / "python",
-        "shift\n"  # drop "-u"
-        "shift\n"  # drop train_smith_agent.py
         'printf "%s\\n" "$@" > "$MOCK_TRAINER_ARGS"\n'
-        'printf "%s|%s|%s\\n" "$TMPDIR" "$RAY_TMPDIR" "$TENSORBOARD_DIR" > "$MOCK_TRAINER_ENV"\n'
+        'printf "%s|%s|%s|%s\\n" "$TMPDIR" "$RAY_TMPDIR" '
+        '"$VERL_WEIGHT_TRANSFER_IPC_DIR" "$TENSORBOARD_DIR" > "$MOCK_TRAINER_ENV"\n'
         'printf "%s\\n" "$CUDA_VISIBLE_DEVICES"\n'
         'exit "$MOCK_TRAINER_STATUS"',
     )
     _executable(
         bin_dir / "agl-server",
         f'printf "%s\\n" "$@" > "$MOCK_SERVER_ARGS"\n'
-        f'echo "server started with $AGL_KEY"\n'
+        f'echo "server ready on {port}"\n'
         f'exec {interpreter} -c "\n'
         f"import http.server, os, signal, sys\n"
         f"from pathlib import Path\n"
@@ -303,18 +393,17 @@ def test_train_launches_both_processes_with_named_logs(
         f'"',
     )
 
-    config = yaml.safe_load(CONFIG.read_text())
-    config["actor_rollout_ref"]["rollout"]["include_routed_experts"] = include_routed_experts
-    config["actor_rollout_ref"]["rollout"]["temperature"] = 0.85
-    config["actor_rollout_ref"]["rollout"]["val_kwargs"] = {"temperature": 0.25}
-    for split in ("train", "val"):
-        dataset = CONFIG.parent / f"{split}.jsonl"
-        (tmp_path / dataset.name).write_bytes(dataset.read_bytes())
-        config["data"][f"{split}_files"] = dataset.name
-    config["data"]["max_train_instances"] = 1
-    config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(config))
+    config_path = _write_experiment(
+        tmp_path,
+        rollout_overrides={
+            "include_routed_experts": include_routed_experts,
+            "temperature": 0.85,
+            "val_kwargs": {"temperature": 0.25},
+        },
+    )
 
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ARBAS_MACHINE_FILE", raising=False)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("AGL_KEY", "shared-test-key")
     monkeypatch.setenv("AGL_SERVER_PORT", str(port))
@@ -332,47 +421,129 @@ def test_train_launches_both_processes_with_named_logs(
         patch.object(launch, "healthy", return_value=True),
         pytest.raises(SystemExit, match="already running"),
     ):
-        launch.main(["train", "--config", str(config_path)])
+        launch.main(["train", "--remote", "--config", str(config_path)])
 
-    status = launch.main(["train", "h200-2b", "--config", str(config_path)])
+    status = launch.main(["train", "h200-2b", "--remote", "--config", str(config_path)])
     assert status == trainer_status
     captured = capsys.readouterr()
 
-    server_args = (tmp_path / "server-args").read_text()
+    server_args = (tmp_path / "server-args").read_text(encoding="utf-8")
     assert "default_proxy.train.temperature=0.85" in server_args
     assert "default_proxy.val.temperature=0.25" in server_args
     assert f"default_proxy.include_routed_experts={str(include_routed_experts).lower()}" in server_args
 
-    active = json.loads((tmp_path / "runs/active.json").read_text())["run_id"]
-    assert re.fullmatch(r"h200-2b-\d{4}-\d{2}", active)
-    run_dir = tmp_path / "runs" / active
+    active = json.loads((tmp_path / "runs/active.json").read_text(encoding="utf-8"))
+    active_id = active["run_id"]
+    assert re.fullmatch(r"h200-2b-\d{4}-\d{2}", active_id)
+    assert active["max_workers"] == 8
+    assert active["cpus"] == 1.0
+    assert active["memory"] == "6g"
+    run_dir = tmp_path / "runs" / active_id
     assert (tmp_path / "runs/latest").resolve() == run_dir
     snapshot = run_dir / "training.yaml"
-    saved_config = yaml.safe_load(snapshot.read_text())
+    saved_config = yaml.safe_load(snapshot.read_text(encoding="utf-8"))
     assert saved_config["experiment"]["name"] == "h200-2b"
     assert saved_config["data"]["train_files"] == str(tmp_path / "train.jsonl")
     assert saved_config["ray_kwargs"]["ray_init"]["runtime_env"]["env_vars"]["MAX_JOBS"] == "2"
-    assert "server started with [redacted]" in (run_dir / f"{active}-server.log").read_text()
-    assert (run_dir / f"{active}-trainer.log").read_text().strip() == "5"
-    trainer_args = (tmp_path / "trainer-args").read_text()
+    assert f"server ready on {port}" in (run_dir / f"{active_id}-server.log").read_text(encoding="utf-8")
+    assert "shared-test-key" not in (run_dir / f"{active_id}-server.log").read_text(encoding="utf-8")
+    assert (run_dir / f"{active_id}-trainer.log").read_text(encoding="utf-8").strip() == "5"
+    trainer_args = (tmp_path / "trainer-args").read_text(encoding="utf-8").splitlines()
+    assert trainer_args[:3] == ["-u", "-m", "examples.swe_smith.train_smith_agent"]
     assert str(snapshot) in trainer_args
-    assert "--smoke" not in trainer_args
-    seen_tmpdir, seen_ray_tmpdir, seen_tb_dir = (tmp_path / "trainer-env").read_text().strip().split("|")
+    seen_tmpdir, seen_ray_tmpdir, seen_ipc_dir, seen_tb_dir = (
+        (tmp_path / "trainer-env").read_text(encoding="utf-8").strip().split("|")
+    )
     assert seen_tmpdir == seen_ray_tmpdir
-    assert Path(seen_tmpdir).parent == tmp_path
+    assert Path(seen_ipc_dir) == Path(seen_tmpdir) / "ipc"
+    assert Path(seen_tmpdir).resolve().parent == tmp_path.resolve()
     assert Path(seen_tb_dir) == run_dir / "tensorboard"
-    assert "run.sh controller" in captured.out
+    assert "Sandbox limits: per container cpus=1 memory=6g" in captured.out
+    assert "run.sh worker" in captured.out
     assert not list(tmp_path.glob("agl-tmp.*"))
 
 
+@pytest.mark.parametrize("controller_fails", [False, True])
+def test_local_train_owns_controller_and_cleans_up_containers(tmp_path, monkeypatch, capsys, controller_fails):
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    (runs_dir / "active.json").write_text('{"run_id":"another-run"}', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ARBAS_MACHINE_FILE", raising=False)
+    monkeypatch.delenv("AGL_SERVER_PORT", raising=False)
+    monkeypatch.delenv("AGL_MAX_LOCAL_JOBS", raising=False)
+    monkeypatch.setenv("AGL_OUTPUT_DIR", str(runs_dir))
+    monkeypatch.setenv("AGL_TMPDIR", str(tmp_path))
+
+    config = tmp_path / "smoke.yaml"
+    config.write_text(f"base: {CONFIG}\ndata:\n  max_train_instances: 1\n", encoding="utf-8")
+
+    events: list[str] = []
+    calls: list[dict] = []
+
+    def fake_prepare(_images):
+        events.append("prepare_images")
+
+    def fake_alloc(_host):
+        events.append("allocate_port")
+        return 54321
+
+    def supervise(**kwargs):
+        calls.append(kwargs)
+        return 0
+
+    with (
+        patch.object(launch, "_resolve_triton_cpath", return_value="/inc"),
+        patch.object(launch, "healthy", return_value=False),
+        patch.object(launch, "prepare_images", side_effect=fake_prepare),
+        patch.object(launch, "_warn_if_docker_limits_unsupported"),
+        patch.object(launch, "_allocate_ephemeral_port", side_effect=fake_alloc),
+        patch.object(launch, "_supervise_training", side_effect=supervise),
+    ):
+        assert launch.main(["train", "local-smoke", "--config", str(config)]) == 0
+
+    assert events == ["prepare_images", "allocate_port"]
+    run_dir = (runs_dir / "latest").resolve()
+    assert (runs_dir / "active.json").read_text(encoding="utf-8") == '{"run_id":"another-run"}'
+    assert calls[0]["trainer_args"][:2] == ["-m", "examples.swe_smith.train_smith_agent"]
+    assert str(run_dir / "training.yaml") in calls[0]["trainer_args"]
+    controller_cmd = calls[0]["controller_cmd"]
+    assert "agl_server.url=http://127.0.0.1:54321" in controller_cmd
+    assert "local_runner.maximum_size=8" in controller_cmd
+    assert not any("agent_url" in arg for arg in controller_cmd)
+    assert "Container budget: max_workers=8, per container cpus=1 memory=6g" in capsys.readouterr().out
+
+    controller = tmp_path / "controller"
+    controller.write_text(
+        f"#!{sys.executable}\nimport sys, time\nprint('controller-started')\n"
+        + ("sys.exit(7)\n" if controller_fails else "time.sleep(60)\n"),
+        encoding="utf-8",
+    )
+    controller.chmod(0o755)
+    with patch.object(launch, "remove_run_containers") as cleanup:
+        supervisor_args = {
+            **calls[0],
+            "trainer_args": ["-c", f"import time; time.sleep({2 if controller_fails else 0.3})"],
+            "server_cmd": None,
+            "controller_cmd": [str(controller)],
+        }
+        if controller_fails:
+            with pytest.raises(SystemExit, match="controller stopped during training"):
+                launch._supervise_training(**supervisor_args)
+        else:
+            assert launch._supervise_training(**supervisor_args) == 0
+    assert (run_dir / f"{run_dir.name}-controller.log").read_text(encoding="utf-8").strip() == "controller-started"
+    cleanup.assert_called_once_with(run_dir)
+
+
 @pytest.mark.parametrize("provider", ["openrouter", "polza"])
-def test_controller_with_minimal_env_configures_single_configmap_and_tunnel(tmp_path, provider):
+def test_worker_opens_loopback_tunnel_pulls_base_images_and_cleans_up(tmp_path, provider):
     root = CONFIG.parents[2]
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     port = _free_port()
     interpreter = shlex.quote(sys.executable)
-    _executable(bin_dir / "python", f'exec {interpreter} "$@"')
+    _install_fake_docker(bin_dir)
 
     _executable(
         bin_dir / "ssh",
@@ -382,7 +553,8 @@ def test_controller_with_minimal_env_configures_single_configmap_and_tunnel(tmp_
         f'    if [ -e "$MOCK_TUNNEL_PID" ]; then kill "$(cat "$MOCK_TUNNEL_PID")" 2>/dev/null || true; fi\n'
         f'    rm -f "$MOCK_TUNNEL_READY" "$MOCK_TUNNEL_PID";;\n'
         f'  *"cat "*)\n'
-        f'    printf \'{{"run_id":"exp-1117-18","images":["repo/first","repo/second"]}}\';;\n'
+        f'    printf \'{{"run_id":"exp-1117-18","images":["repo/first","repo/second"],'
+        f'"max_workers":4,"cpus":1.5,"memory":"6g"}}\';;\n'
         f"  *)\n"
         f'    {interpreter} -c "\n'
         f"import http.server\n"
@@ -396,56 +568,38 @@ def test_controller_with_minimal_env_configures_single_configmap_and_tunnel(tmp_
         f"    sleep 0.1;;\n"
         f"esac",
     )
-    _executable(
-        bin_dir / "kubectl",
-        'printf "%s\\n" "$*" >> "$MOCK_KUBECTL_LOG"\n'
-        'case "$*" in *"apply -f -"*) cat >/dev/null;; *"--dry-run=client"*) echo "kind: Secret";; esac',
-    )
     _executable(bin_dir / "agl-controller", 'printf "%s\\n" "$@" > "$MOCK_CONTROLLER_ARGS"\necho ready')
-
-    (tmp_path / "docker.py").write_text(
-        "import os\n"
-        "class Images:\n"
-        "    def get(self, name):\n"
-        "        assert not {'OPENROUTER_API_KEY', 'POLZA_API_KEY', 'AGL_KEY'} & os.environ.keys()\n"
-        "        with open(os.environ['MOCK_IMAGES_LOG'], 'a') as f: f.write(name + '\\n')\n"
-        "        return object()\n"
-        "class Client:\n"
-        "    images = Images()\n"
-        "def from_env(): return Client()\n"
-    )
 
     config_home = tmp_path / "home"
     arbas_dir = config_home / ".config/arbas"
     arbas_dir.mkdir(parents=True)
-    # 4-field minimal profile; AGL_SERVER_PORT overridden to dynamic free port for local health server.
     (arbas_dir / "ipavlov.env").write_text(
         f"SSH_TARGET=gpu-host\n"
         f"REMOTE_REPO_DIR=/data/home/user/arbas\n"
         f"AGL_KEY=shared-test-key\n"
         f"{provider.upper()}_API_KEY=router-test-secret\n"
-        f"AGL_SERVER_PORT={port}\n"
+        f"AGL_SERVER_PORT={port}\n",
+        encoding="utf-8",
     )
     env = {
         **os.environ,
         "HOME": str(config_home),
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "VIRTUAL_ENV": sys.prefix,
-        "PYTHONPATH": f"{tmp_path}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "AGL_OUTPUT_DIR": str(tmp_path / "runs"),
         "MOCK_TUNNEL_READY": str(tmp_path / "tunnel"),
         "MOCK_TUNNEL_PID": str(tmp_path / "tunnel.pid"),
         "MOCK_SSH_LOG": str(tmp_path / "ssh-log"),
-        "MOCK_KUBECTL_LOG": str(tmp_path / "kubectl-log"),
         "MOCK_CONTROLLER_ARGS": str(tmp_path / "controller-args"),
+        "MOCK_DOCKER_LOG": str(tmp_path / "docker-log"),
         "MOCK_IMAGES_LOG": str(tmp_path / "images"),
+        "MOCK_PULLED_LOG": str(tmp_path / "pulled"),
     }
     env.pop("ARBAS_MACHINE_FILE", None)
     env.pop("OPENROUTER_API_KEY", None)
     env.pop("POLZA_API_KEY", None)
 
     result = subprocess.run(
-        ["bash", "examples/swe_smith/run.sh", "controller", "ipavlov"],
+        [sys.executable, "-u", "-m", "examples.swe_smith.launch", "worker", "ipavlov"],
         cwd=root,
         env=env,
         capture_output=True,
@@ -454,368 +608,113 @@ def test_controller_with_minimal_env_configures_single_configmap_and_tunnel(tmp_
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "router-test-secret" not in result.stdout + result.stderr
-    assert "Prepared 2 SWE-smith :arbas images" in result.stdout
-    assert set((tmp_path / "images").read_text().splitlines()) == {"repo/first:arbas", "repo/second:arbas"}
-    assert (tmp_path / "runs/exp-1117-18/exp-1117-18-controller.log").read_text().strip() == "ready"
+    assert "Prepared 2 SWE-smith images." in result.stdout
+    assert set((tmp_path / "images").read_text(encoding="utf-8").splitlines()) == {"repo/first", "repo/second"}
+    assert set((tmp_path / "pulled").read_text(encoding="utf-8").splitlines()) == {"repo/first", "repo/second"}
+    assert ":arbas" not in (tmp_path / "docker-log").read_text(encoding="utf-8")
+    run_dir = tmp_path / "runs/exp-1117-18"
+    assert (run_dir / "exp-1117-18-worker.log").read_text(encoding="utf-8").strip() == "ready"
+    assert f"ps -aq --filter label=arbas.run={run_dir.resolve()}" in (tmp_path / "docker-log").read_text(
+        encoding="utf-8"
+    )
 
-    kubectl_log = (tmp_path / "kubectl-log").read_text()
-    assert "swe-smith-agent-scripts" in kubectl_log
-    assert "swe-smith-oracle-scripts" not in kubectl_log
-    assert f"create secret generic swe-smith-{provider}" in kubectl_log
-    assert kubectl_log.count("create secret generic") == 1
-    assert "router-test-secret" not in kubectl_log
-    secret_path = re.search(r"--from-file=api-key=(\S+)", kubectl_log)
-    assert secret_path and not Path(secret_path.group(1)).exists()
-
-    ssh_log = (tmp_path / "ssh-log").read_text()
-    assert f"0.0.0.0:{port}:127.0.0.1:8080" in ssh_log
+    ssh_log = (tmp_path / "ssh-log").read_text(encoding="utf-8")
+    assert f"-L 127.0.0.1:{port}:127.0.0.1:8080" in ssh_log
+    assert "0.0.0.0" not in ssh_log
     assert "/data/home/user/arbas/outputs/swe-smith/active.json" in ssh_log
     assert "-O exit" in ssh_log
     assert not (tmp_path / "tunnel").exists()
 
-    controller_args = (tmp_path / "controller-args").read_text()
-    assert "runner_type=k8s" in controller_args
-    assert f"agl_server.agent_url=http://host.docker.internal:{port}" in controller_args
-    assert "k8s_runner.namespace=default" in controller_args
+    controller_args = (tmp_path / "controller-args").read_text(encoding="utf-8")
+    assert "runner_type=local" in controller_args
+    assert f"agl_server.url=http://127.0.0.1:{port}" in controller_args
+    assert "local_runner.maximum_size=4" in controller_args
+    assert "agent_url" not in controller_args
+    assert "Container budget: max_workers=4, per container cpus=1.5 memory=6g" in result.stdout
+
+
+def test_worker_budget_respects_agl_max_local_jobs_and_warns_without_cgroups(tmp_path, monkeypatch, capsys):
+    with (
+        patch.object(launch.importlib.util, "find_spec", side_effect=lambda pkg: None if pkg == "openai" else object()),
+        pytest.raises(SystemExit, match=r"\.\[worker\]"),
+    ):
+        launch._require_worker_deps()
+
+    for bad in ("0", "-1", "abc"):
+        monkeypatch.setenv("AGL_MAX_LOCAL_JOBS", bad)
+        with pytest.raises(SystemExit, match="AGL_MAX_LOCAL_JOBS"):
+            launch._resolve_worker_budget(default_max_workers=8, cpus=1.0, memory="6g")
+
+    monkeypatch.setenv("AGL_MAX_LOCAL_JOBS", "2")
+    assert launch._resolve_worker_budget(default_max_workers=8, cpus=1.0, memory="6g") == 2
+    assert "max_workers=2, per container cpus=1 memory=6g (peak 2 CPUs, 12.0 GiB RAM)" in capsys.readouterr().out
+
+    with patch.object(
+        launch.subprocess,
+        "run",
+        return_value=subprocess.CompletedProcess([], 0, '{"MemoryLimit": false, "CpuCfsQuota": false}', ""),
+    ):
+        launch._warn_if_docker_limits_unsupported()
+    assert "disabled cgroup limits (memory, cpu)" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("existing_tunnel", [True, False])
-def test_controller_handles_optional_secret_and_existing_tunnel(tmp_path, existing_tunnel):
+def test_worker_handles_existing_tunnel_and_local_gateway(tmp_path, existing_tunnel):
     root = CONFIG.parents[2]
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     port = _free_port()
-    interpreter = shlex.quote(sys.executable)
-    _executable(bin_dir / "python", f'exec {interpreter} "$@"')
+    _install_fake_docker(bin_dir)
     _executable(
         bin_dir / "ssh",
         'printf "%s\\n" "$*" >> "$MOCK_SSH_LOG"\n'
-        'case "$*" in *"-O exit"*) rm -f "$MOCK_TUNNEL_READY";; '
-        '*"cat "*) printf \'{"run_id":"x","images":["repo/first","repo/second"]}\';; esac',
+        'case "$*" in *"cat "*) printf \'{"run_id":"x","images":["repo/first","repo/second"]}\';; esac',
     )
-    _executable(
-        bin_dir / "kubectl",
-        'printf "%s\\n" "$*" >> "$MOCK_KUBECTL_LOG"\n'
-        'case "$*" in *"apply -f -"*) cat >/dev/null;; *"--dry-run=client"*) echo "kind: ConfigMap";; esac',
-    )
-    _executable(bin_dir / "agl-controller", "echo ready")
-
-    (tmp_path / "docker.py").write_text(
-        "import os\n"
-        "class Images:\n"
-        "    def get(self, name):\n"
-        "        assert 'OPENROUTER_API_KEY' not in os.environ and 'AGL_KEY' not in os.environ\n"
-        "        with open(os.environ['MOCK_IMAGES_LOG'], 'a') as f: f.write(name + '\\n')\n"
-        "        return object()\n"
-        "class Client:\n"
-        "    images = Images()\n"
-        "def from_env(): return Client()\n"
-    )
-
-    server = None
-    if existing_tunnel:
-        import http.server
-        import threading
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"ok")
-
-            def log_message(self, *args):
-                pass
-
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        (tmp_path / "tunnel").touch()
+    _executable(bin_dir / "agl-controller", 'printf "%s\\n" "$@" > "$MOCK_CONTROLLER_ARGS"\necho ready')
 
     machine = tmp_path / "machine.env"
     machine.write_text(
         f"AGL_KEY=shared-test-key\nAGL_SERVER_PORT={port}\n"
-        + ("SSH_TARGET=gpu-host\nAGL_REMOTE_OUTPUT_DIR='/path with spaces/outputs'\n" if existing_tunnel else "")
+        + ("SSH_TARGET=gpu-host\nAGL_REMOTE_OUTPUT_DIR='/path with spaces/outputs'\n" if existing_tunnel else ""),
+        encoding="utf-8",
     )
     env = {
         **os.environ,
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "VIRTUAL_ENV": sys.prefix,
-        "PYTHONPATH": f"{tmp_path}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "ARBAS_MACHINE_FILE": str(machine),
         "AGL_OUTPUT_DIR": str(tmp_path / "runs"),
-        "MOCK_TUNNEL_READY": str(tmp_path / "tunnel"),
         "MOCK_SSH_LOG": str(tmp_path / "ssh-log"),
-        "MOCK_KUBECTL_LOG": str(tmp_path / "kubectl-log"),
-        "MOCK_IMAGES_LOG": str(tmp_path / "images"),
-    }
-    env.pop("OPENROUTER_API_KEY", None)
-
-    try:
-        if not existing_tunnel:
-            import http.server
-            import threading
-
-            class Handler2(http.server.BaseHTTPRequestHandler):
-                def do_GET(self):
-                    self.send_response(200)
-                    self.end_headers()
-                    self.wfile.write(b"ok")
-
-                def log_message(self, *args):
-                    pass
-
-            server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler2)
-            threading.Thread(target=server.serve_forever, daemon=True).start()
-
-        result = subprocess.run(
-            ["bash", "examples/swe_smith/run.sh", "controller"],
-            cwd=root,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    finally:
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "create secret generic" not in (tmp_path / "kubectl-log").read_text()
-    if existing_tunnel:
-        assert (tmp_path / "tunnel").exists()
-        assert "-O exit" not in (tmp_path / "ssh-log").read_text()
-        assert "'/path with spaces/outputs/active.json'" in (tmp_path / "ssh-log").read_text()
-        assert set((tmp_path / "images").read_text().splitlines()) == {"repo/first:arbas", "repo/second:arbas"}
-    else:
-        ctrl_dirs = list((tmp_path / "runs").glob("controller-*"))
-        assert len(ctrl_dirs) == 1
-        assert (ctrl_dirs[0] / f"{ctrl_dirs[0].name}-controller.log").read_text().strip() == "ready"
-
-
-def test_controller_local_mode_runs_local_runner_without_k8s(tmp_path):
-    root = CONFIG.parents[2]
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    port = _free_port()
-    interpreter = shlex.quote(sys.executable)
-    _executable(bin_dir / "python", f'exec {interpreter} "$@"')
-    _executable(bin_dir / "agl-controller", 'printf "%s\\n" "$@" > "$MOCK_CONTROLLER_ARGS"\necho ready')
-    _executable(bin_dir / "kubectl", 'echo "kubectl should not be called" >&2; exit 1')
-    _executable(bin_dir / "ssh", 'echo "ssh should not be called" >&2; exit 1')
-    _executable(
-        bin_dir / "docker",
-        'printf "%s\\n" "$*" >> "$MOCK_DOCKER_LOG"\n'
-        'exit 0',
-    )
-
-    (tmp_path / "docker.py").write_text(
-        "import os\n"
-        "class Images:\n"
-        "    def get(self, name):\n"
-        "        with open(os.environ['MOCK_IMAGES_LOG'], 'a') as f: f.write(name + '\\n')\n"
-        "        return object()\n"
-        "class Client:\n"
-        "    images = Images()\n"
-        "def from_env(): return Client()\n"
-    )
-
-    runs_dir = tmp_path / "runs"
-    runs_dir.mkdir()
-    active_run_dir = runs_dir / "exp-local-1"
-    active_run_dir.mkdir()
-    (runs_dir / "active.json").write_text(
-        json.dumps({"run_id": "exp-local-1", "images": ["repo/local-task"]}),
-        encoding="utf-8",
-    )
-
-    import http.server
-    import threading
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-
-        def log_message(self, *args):
-            pass
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-
-    env = {
-        **os.environ,
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "VIRTUAL_ENV": sys.prefix,
-        "PYTHONPATH": f"{tmp_path}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-        "AGL_OUTPUT_DIR": str(runs_dir),
-        "AGL_SERVER_PORT": str(port),
         "MOCK_CONTROLLER_ARGS": str(tmp_path / "controller-args"),
-        "MOCK_IMAGES_LOG": str(tmp_path / "images"),
         "MOCK_DOCKER_LOG": str(tmp_path / "docker-log"),
+        "MOCK_IMAGES_LOG": str(tmp_path / "images"),
+        "MOCK_PULLED_LOG": str(tmp_path / "pulled"),
     }
-    env.pop("ARBAS_MACHINE_FILE", None)
-    env.pop("SSH_TARGET", None)
-    env.pop("AGL_SSH_TARGET", None)
 
-    try:
+    with _health_server(port):
         result = subprocess.run(
-            ["bash", "examples/swe_smith/run.sh", "controller", "local"],
+            [sys.executable, "-u", "-m", "examples.swe_smith.launch", "worker"],
             cwd=root,
             env=env,
             capture_output=True,
             text=True,
             timeout=15,
         )
-    finally:
-        server.shutdown()
-        server.server_close()
 
     assert result.returncode == 0, result.stdout + result.stderr
-    docker_log = (tmp_path / "docker-log").read_text()
-    assert "run --rm --network host repo/local-task:arbas" in docker_log
-    assert f"http://127.0.0.1:{port}/healthz" in docker_log
-
-    controller_args = (tmp_path / "controller-args").read_text()
-    assert "runner_type=local" in controller_args
-    assert f"agl_server.url=http://127.0.0.1:{port}" in controller_args
-    assert "local_runner.maximum_size=32" in controller_args
-    assert "k8s_runner" not in controller_args
-    assert (active_run_dir / "exp-local-1-controller.log").read_text().strip() == "ready"
-    assert (tmp_path / "images").read_text().strip() == "repo/local-task:arbas"
-
-
-def test_controller_local_mode_fails_if_container_network_fails(tmp_path):
-    root = CONFIG.parents[2]
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    port = _free_port()
-    interpreter = shlex.quote(sys.executable)
-    _executable(bin_dir / "python", f'exec {interpreter} "$@"')
-    _executable(bin_dir / "agl-controller", 'echo ready')
-    # Docker fails the connectivity check
-    _executable(
-        bin_dir / "docker",
-        'echo "Connection refused from inside container" >&2; exit 7',
-    )
-
-    (tmp_path / "docker.py").write_text(
-        "import os\n"
-        "class Images:\n"
-        "    def get(self, name):\n"
-        "        return object()\n"
-        "class Client:\n"
-        "    images = Images()\n"
-        "def from_env(): return Client()\n"
-    )
-
-    runs_dir = tmp_path / "runs"
-    runs_dir.mkdir()
-    (runs_dir / "active.json").write_text(
-        json.dumps({"run_id": "exp-local-fail", "images": ["repo/fail-task"]}),
-        encoding="utf-8",
-    )
-
-    import http.server
-    import threading
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-
-        def log_message(self, *args):
-            pass
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-
-    env = {
-        **os.environ,
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "VIRTUAL_ENV": sys.prefix,
-        "PYTHONPATH": f"{tmp_path}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-        "AGL_OUTPUT_DIR": str(runs_dir),
-        "AGL_SERVER_PORT": str(port),
-    }
-    env.pop("ARBAS_MACHINE_FILE", None)
-    env.pop("SSH_TARGET", None)
-    env.pop("AGL_SSH_TARGET", None)
-
-    try:
-        result = subprocess.run(
-            ["bash", "examples/swe_smith/run.sh", "controller", "local"],
-            cwd=root,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    assert result.returncode != 0
-    assert "ERROR: container cannot reach server" in result.stderr
-    assert "In rootless Docker, --network=host attaches to RootlessKit's network namespace" in result.stderr
-    assert "AGL_SERVER_AGENT_URL" in result.stderr
-
-
-def test_trainer_and_server_roles_and_missing_active_json(tmp_path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    port = _free_port()
-    interpreter = shlex.quote(sys.executable)
-
-    _executable(
-        bin_dir / "python",
-        'printf "%s\\n" "$@" > "$MOCK_TRAINER_ARGS"\nexit 0',
-    )
-    _executable(
-        bin_dir / "agl-server",
-        'echo "server secret=$AGL_KEY"\nexit 0',
-    )
-
-    cfg = yaml.safe_load(CONFIG.read_text())
-    for split in ("train", "val"):
-        dataset = CONFIG.parent / f"{split}.jsonl"
-        (tmp_path / dataset.name).write_bytes(dataset.read_bytes())
-        cfg["data"][f"{split}_files"] = dataset.name
-    cfg["data"]["max_train_instances"] = 1
-    cfg_path = tmp_path / "exp.yaml"
-    cfg_path.write_text(yaml.safe_dump(cfg))
-
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("AGL_KEY", "srv-secret")
-    monkeypatch.setenv("AGL_SERVER_PORT", str(port))
-    monkeypatch.setenv("AGL_OUTPUT_DIR", str(tmp_path / "runs"))
-    monkeypatch.setenv("MOCK_TRAINER_ARGS", str(tmp_path / "trainer-args"))
-    monkeypatch.setattr(launch.sys, "executable", str(bin_dir / "python"))
-
-    assert launch.main(["server", "srv-exp", "--config", str(cfg_path)]) == 0
-    run_id = json.loads((tmp_path / "runs/active.json").read_text())["run_id"]
-    assert "server secret=[redacted]" in (tmp_path / "runs" / run_id / f"{run_id}-server.log").read_text()
-
-    with (
-        patch.object(launch, "healthy", return_value=True),
-        pytest.raises(SystemExit, match=r"active\.json not found"),
-    ):
-        (tmp_path / "runs/active.json").unlink()
-        launch.main(["trainer"])
-
-    (tmp_path / "runs/active.json").write_text(json.dumps({"run_id": run_id, "images": []}))
-    with patch.object(launch, "healthy", return_value=True):
-        assert launch.main(["trainer"]) == 0
-    assert str(tmp_path / "runs" / run_id / "training.yaml") in (tmp_path / "trainer-args").read_text()
-    _executable(bin_dir / "python", f'exec {interpreter} "$@"')
+    assert "runner_type=local" in (tmp_path / "controller-args").read_text(encoding="utf-8")
+    if existing_tunnel:
+        ssh_log = (tmp_path / "ssh-log").read_text(encoding="utf-8")
+        assert "-O exit" not in ssh_log
+        assert "'/path with spaces/outputs/active.json'" in ssh_log
+        assert set((tmp_path / "images").read_text(encoding="utf-8").splitlines()) == {"repo/first", "repo/second"}
+    else:
+        assert not (tmp_path / "ssh-log").exists()
+        worker_dirs = list((tmp_path / "runs").glob("worker-*"))
+        assert len(worker_dirs) == 1
+        assert (worker_dirs[0] / f"{worker_dirs[0].name}-worker.log").read_text(encoding="utf-8").strip() == "ready"
 
 
 def test_supervise_training_interrupt_startup_and_cleanup_order(tmp_path, monkeypatch):
-    import signal
-    import threading
-    import time
-
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     _executable(bin_dir / "slow-server", "trap 'exit 0' TERM\nwhile :; do sleep 0.1; done")
@@ -855,7 +754,7 @@ def test_supervise_training_interrupt_startup_and_cleanup_order(tmp_path, monkey
         from contextlib import suppress
 
         events.append("stop_children")
-        pid = int(orphan_pid_file.read_text())
+        pid = int(orphan_pid_file.read_text(encoding="utf-8"))
         with suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
         with suppress(ChildProcessError):
@@ -872,9 +771,8 @@ def test_supervise_training_interrupt_startup_and_cleanup_order(tmp_path, monkey
     fake_proc_task = tmp_path / "proc_task"
     fake_children_dir = fake_proc_task / str(threading.get_native_id())
     fake_children_dir.mkdir(parents=True)
-    (fake_children_dir / "children").write_text("")
+    (fake_children_dir / "children").write_text("", encoding="utf-8")
 
-    # Exercise the exact Linux cleanup path by mocking sys.platform and prctl/children.
     monkeypatch.setattr(launch.sys, "platform", "linux")
     with (
         patch.object(launch, "Path", wraps=Path) as mock_path,
@@ -898,7 +796,7 @@ def test_supervise_training_interrupt_startup_and_cleanup_order(tmp_path, monkey
         )
         assert rc2 == 0
         assert time.monotonic() - t1 < 3.0
-    assert "trailing-trainer-line" in (tmp_path / "trainer-cleanup.log").read_text()
+    assert "trailing-trainer-line" in (tmp_path / "trainer-cleanup.log").read_text(encoding="utf-8")
     assert events[0] == "stop_children"
     assert any(e.startswith("join:") for e in events[1:])
 
@@ -910,7 +808,226 @@ def test_prepare_run_error_paths(tmp_path):
         launch.prepare_run(CONFIG, tmp_path, "Invalid_Name")
 
 
-def test_qwen35_chat_template_is_prefix_preserving():
+def test_prepare_run_rejects_empty_val_dataset_before_allocating_dir(tmp_path):
+    cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    train_ds = CONFIG.parent / "train.jsonl"
+    (tmp_path / "train.jsonl").write_bytes(train_ds.read_bytes())
+    (tmp_path / "val.jsonl").write_text("", encoding="utf-8")
+    cfg["data"]["train_files"] = "train.jsonl"
+    cfg["data"]["val_files"] = "val.jsonl"
+    cfg["trainer"]["val_before_train"] = False
+    cfg_path = tmp_path / "empty-val.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    with pytest.raises(SystemExit, match="invalid dataset"):
+        launch.prepare_run(cfg_path, runs_dir, "empty-val")
+    assert list(runs_dir.iterdir()) == []
+
+
+def test_resolve_triton_cpath_checks_only_active_interpreter_include(tmp_path, monkeypatch):
+    inc = tmp_path / "active-include"
+    inc.mkdir()
+    (inc / "Python.h").write_text("/* stub */\n", encoding="utf-8")
+    foreign_inc = tmp_path / "foreign-include"
+    foreign_inc.mkdir()
+    (foreign_inc / "Python.h").write_text("/* stub */\n", encoding="utf-8")
+
+    monkeypatch.setattr(launch.sysconfig, "get_path", lambda name: str(inc) if name == "include" else None)
+    monkeypatch.setenv("CPATH", "/other/dir")
+    assert launch._resolve_triton_cpath() == f"{inc}{os.pathsep}/other/dir"
+
+    monkeypatch.setenv("CPATH", f"{inc}{os.pathsep}/other/dir")
+    assert launch._resolve_triton_cpath() == f"{inc}{os.pathsep}/other/dir"
+
+    missing_inc = tmp_path / "missing-include"
+    missing_inc.mkdir()
+    monkeypatch.setattr(launch.sysconfig, "get_path", lambda name: str(missing_inc) if name == "include" else None)
+    monkeypatch.setenv("CPATH", str(foreign_inc))
+    with pytest.raises(SystemExit, match="setup_training\\.sh"):
+        launch._resolve_triton_cpath()
+
+
+def test_run_train_checks_triton_cpath_on_linux(tmp_path, monkeypatch):
+    root = tmp_path / "runs"
+    root.mkdir()
+    cfg_path = _write_experiment(tmp_path, max_train_instances=None)
+
+    inc = tmp_path / "py-include"
+    inc.mkdir()
+    (inc / "Python.h").write_text("/* stub */\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ARBAS_MACHINE_FILE", raising=False)
+    monkeypatch.setenv("AGL_OUTPUT_DIR", str(root))
+    monkeypatch.setenv("AGL_TMPDIR", str(tmp_path))
+    monkeypatch.setenv("AGL_SERVER_PORT", str(_free_port()))
+    monkeypatch.delenv("CPATH", raising=False)
+    monkeypatch.setattr(launch.sys, "platform", "linux")
+    monkeypatch.setattr(launch.sysconfig, "get_path", lambda name: str(inc) if name == "include" else None)
+
+    seen_envs = []
+
+    def supervise(**kwargs):
+        seen_envs.append(kwargs["trainer_env"])
+        return 0
+
+    with (
+        patch.object(launch, "healthy", return_value=False),
+        patch.object(launch, "_supervise_training", side_effect=supervise),
+    ):
+        assert launch.main(["train", "linux-exp", "--remote", "--config", str(cfg_path)]) == 0
+    assert seen_envs[0]["CPATH"] == str(inc)
+
+
+def test_long_scratch_creates_short_unix_socket_symlink_on_linux(tmp_path, monkeypatch):
+    long_scratch = tmp_path / ("nested-scratch-dir-" * 4)
+    long_scratch.mkdir(parents=True)
+    assert not launch._sockets_fit_unix_limit(long_scratch / "agl-tmp.12345678", long_scratch / "agl-tmp.12345678/ipc")
+
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    cfg_path = _write_experiment(tmp_path, max_train_instances=None)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ARBAS_MACHINE_FILE", raising=False)
+    monkeypatch.setenv("AGL_OUTPUT_DIR", str(runs))
+    monkeypatch.setenv("AGL_TMPDIR", str(long_scratch))
+    monkeypatch.setenv("AGL_SERVER_PORT", str(_free_port()))
+    monkeypatch.setattr(launch.sys, "platform", "linux")
+
+    captured = {}
+
+    def supervise(**kwargs):
+        env = kwargs["trainer_env"]
+        captured["trainer_env"] = env
+        captured["fits"] = launch._sockets_fit_unix_limit(
+            Path(env["RAY_TMPDIR"]), Path(env["VERL_WEIGHT_TRANSFER_IPC_DIR"])
+        )
+        captured["resolved_parent"] = Path(env["RAY_TMPDIR"]).resolve().parent
+        return 0
+
+    with (
+        patch.object(launch, "_resolve_triton_cpath", return_value="/inc"),
+        patch.object(launch, "healthy", return_value=False),
+        patch.object(launch, "_supervise_training", side_effect=supervise),
+    ):
+        assert launch.main(["train", "long-tmp", "--remote", "--config", str(cfg_path)]) == 0
+
+    assert captured["fits"] is True
+    assert captured["trainer_env"]["TMPDIR"] == captured["trainer_env"]["RAY_TMPDIR"]
+    assert Path(captured["trainer_env"]["VERL_WEIGHT_TRANSFER_IPC_DIR"]) == (
+        Path(captured["trainer_env"]["RAY_TMPDIR"]) / "ipc"
+    )
+    assert captured["trainer_env"]["RAY_TMPDIR"].startswith("/tmp/agl.")
+    assert captured["resolved_parent"] == long_scratch.resolve()
+
+
+@pytest.mark.parametrize("var", ["AGL_SERVER_PORT", "AGL_SSH_REMOTE_PORT"])
+def test_configured_port_validation(monkeypatch, var):
+    monkeypatch.delenv(var, raising=False)
+    assert launch._configured_port(var) is None
+
+    monkeypatch.setenv(var, "8080")
+    assert launch._configured_port(var) == 8080
+
+    for bad_port in ("0", "99999", "abc"):
+        monkeypatch.setenv(var, bad_port)
+        with pytest.raises(SystemExit, match=var):
+            launch._configured_port(var)
+
+
+def test_load_profile_env_preserves_bash_semantics(tmp_path, monkeypatch):
+    config_home = tmp_path / "home"
+    arbas_dir = config_home / ".config/arbas"
+    arbas_dir.mkdir(parents=True)
+    (arbas_dir / "bashy.env").write_text(
+        "echo 'loading profile'\n"
+        "VAR=outer\n"
+        "AGL_KEY='literal$VAR' # inline comment\n"
+        'EXPANDED="prefix_${VAR}_suffix"\n'
+        'FALLBACK="${ARBAS_TEST_UNSET:-default_val}"\n'
+        "CUDA_VISIBLE_DEVICES=0,1\n",
+        encoding="utf-8",
+    )
+    (arbas_dir / "broken.env").write_text("UNCLOSED='oops\n", encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(config_home))
+    monkeypatch.delenv("ARBAS_MACHINE_FILE", raising=False)
+    monkeypatch.delenv("ARBAS_TEST_UNSET", raising=False)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+
+    launch._load_profile_env("bashy")
+    assert os.environ["AGL_KEY"] == "literal$VAR"
+    assert os.environ["EXPANDED"] == "prefix_outer_suffix"
+    assert os.environ["FALLBACK"] == "default_val"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "3"
+
+    with pytest.raises(SystemExit, match="failed to load"):
+        launch._load_profile_env("broken")
+
+
+def test_cli_validation():
+    for bad in (
+        ["train", "smoke", "local"],
+        ["worker", "--config", "foo.yaml"],
+        ["worker", "h200", "--profile", "ipavlov"],
+        ["controller"],
+        ["worker", "Bad_Profile"],
+    ):
+        with pytest.raises(SystemExit):
+            launch.parse_args(bad)
+
+    train_remote = launch.parse_args(["train", "exp", "--remote"])
+    assert (train_remote.command, train_remote.name, train_remote.remote) == ("train", "exp", True)
+
+    worker_pos = launch.parse_args(["worker", "ipavlov"])
+    assert (worker_pos.command, worker_pos.profile_name) == ("worker", "ipavlov")
+
+    worker_flag = launch.parse_args(["worker", "--profile", "h200"])
+    assert (worker_flag.command, worker_flag.profile_name) == ("worker", "h200")
+
+
+def test_train_smith_agent_main_resolves_experiment_once(tmp_path, monkeypatch):
+    from examples.swe_smith import train_smith_agent
+
+    cfg_path = _write_experiment(tmp_path, max_train_instances=None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_smith_agent.py",
+            "--config",
+            str(cfg_path),
+            "--agl-base-url",
+            "http://127.0.0.1:8080",
+            "--agl-key",
+            "k",
+            "agents.orchestrator.max_turns=9",
+        ],
+    )
+    resolved = resolve_experiment(cfg_path, ["agents.orchestrator.max_turns=9"])
+    assert resolved.agents.orchestrator.max_turns == 9
+
+    fake_cfg = OmegaConf.create({"ok": True})
+    with (
+        patch.object(
+            train_smith_agent,
+            "load_experiment_config",
+            wraps=train_smith_agent.load_experiment_config,
+        ) as spy,
+        patch.object(train_smith_agent, "build_config", return_value=fake_cfg) as mock_build_config,
+        patch.object(train_smith_agent, "train") as mock_train,
+    ):
+        train_smith_agent.main()
+    assert spy.call_count == 1
+    assert isinstance(mock_build_config.call_args.kwargs["config_path"], DictConfig)
+    mock_train.assert_called_once()
+    parsed = AgentSettings.model_validate_json(mock_train.call_args.kwargs["agent_config_json"])
+    assert parsed.orchestrator.max_turns == 9
+
+
+def _qwen35_template():
     from jinja2.sandbox import ImmutableSandboxedEnvironment
 
     env = ImmutableSandboxedEnvironment(trim_blocks=False, lstrip_blocks=False)
@@ -918,8 +1035,12 @@ def test_qwen35_chat_template_is_prefix_preserving():
     env.filters["items"] = lambda d: list(d.items())
     env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
     template_path = Path(__file__).resolve().parents[2] / "examples/swe_smith/qwen35_chat_template.jinja"
-    tmpl = env.from_string(template_path.read_text(encoding="utf-8"))
-    tools = [{"type": "function", "function": {"name": "create_subagent", "parameters": {"type": "object"}}}]
+    return env.from_string(template_path.read_text(encoding="utf-8"))
+
+
+def test_qwen35_chat_template_is_prefix_preserving():
+    tmpl = _qwen35_template()
+    tools = [{"type": "function", "function": {"name": "assign_task", "parameters": {"type": "object"}}}]
 
     msgs = [
         {"role": "system", "content": "Sys"},
@@ -928,16 +1049,18 @@ def test_qwen35_chat_template_is_prefix_preserving():
             "role": "assistant",
             "reasoning_content": "First step\n\n",
             "content": None,
-            "tool_calls": [{"function": {"name": "create_subagent", "arguments": {"name": "research"}}}],
+            "tool_calls": [
+                {"function": {"name": "assign_task", "arguments": {"profile": "research", "prompt": "Find bug"}}}
+            ],
         },
-        {"role": "tool", "content": '{"agent_name": "research_1"}'},
+        {"role": "tool", "content": '{"agent_name": "research_1", "status": "completed"}'},
         {
             "role": "assistant",
             "reasoning": None,
             "content": None,
-            "tool_calls": [{"function": {"name": "create_subagent", "arguments": {"name": "fix"}}}],
+            "tool_calls": [{"function": {"name": "assign_task", "arguments": {"profile": "fix", "prompt": "Fix bug"}}}],
         },
-        {"role": "tool", "content": '{"agent_name": "fix_2"}'},
+        {"role": "tool", "content": '{"agent_name": "fix_2", "status": "completed"}'},
         {"role": "user", "content": "Retry one tool call."},
         {"role": "assistant", "reasoning_content": "Final\n", "content": "Done\n"},
     ]
@@ -945,15 +1068,17 @@ def test_qwen35_chat_template_is_prefix_preserving():
     p0 = tmpl.render(messages=msgs[:2], tools=tools, add_generation_prompt=True)
     ctx0 = (
         p0
-        + "First step\n\n</think>\n\n<tool_call>\n<function=create_subagent>\n"
-        + "<parameter=name>\nresearch\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+        + "First step\n\n</think>\n\n<tool_call>\n<function=assign_task>\n"
+        + "<parameter=profile>\nresearch\n</parameter>\n"
+        + "<parameter=prompt>\nFind bug\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
     )
     p1 = tmpl.render(messages=msgs[:4], tools=tools, add_generation_prompt=True)
     assert p1.startswith(ctx0)
     ctx1 = (
         p1
-        + "</think>\n\n<tool_call>\n<function=create_subagent>\n"
-        + "<parameter=name>\nfix\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+        + "</think>\n\n<tool_call>\n<function=assign_task>\n"
+        + "<parameter=profile>\nfix\n</parameter>\n"
+        + "<parameter=prompt>\nFix bug\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
     )
     p2 = tmpl.render(messages=msgs[:7], tools=tools, add_generation_prompt=True)
     assert p2.startswith(ctx1)
@@ -974,14 +1099,7 @@ def test_qwen35_chat_template_is_prefix_preserving():
 
 
 def test_qwen35_chat_template_parameter_newline_handling():
-    from jinja2.sandbox import ImmutableSandboxedEnvironment
-
-    env = ImmutableSandboxedEnvironment(trim_blocks=False, lstrip_blocks=False)
-    env.filters["tojson"] = lambda x: json.dumps(x, ensure_ascii=False)
-    env.filters["items"] = lambda d: list(d.items())
-    env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
-    template_path = Path(__file__).resolve().parents[2] / "examples/swe_smith/qwen35_chat_template.jinja"
-    tmpl = env.from_string(template_path.read_text(encoding="utf-8"))
+    tmpl = _qwen35_template()
 
     msgs_trailing_nl = [
         {

@@ -226,6 +226,9 @@ class LocalReconciler:
             env = {
                 **os.environ,
                 "AGL_KEY": str(self._config.agl_server.key or ""),
+                "AGL_ROLLOUT_ID": rollout.rollout_id,
+                "AGL_ATTEMPT_ID": attempt_id,
+                "AGL_ROLLOUT_MODE": mode,
                 "AGL_OPENAI_BASE_URL": (
                     f"{agent_base_url}/proxy/rollout/{rollout.rollout_id}/attempt/{attempt_id}/mode/{mode}/openai/v1"
                 ),

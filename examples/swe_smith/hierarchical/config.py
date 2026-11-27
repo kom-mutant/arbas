@@ -1,10 +1,33 @@
 import os
+import re
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .types import ModelSettings
+
+_MEMORY_UNITS = {"b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
+
+
+def parse_memory_bytes(spec: str) -> int:
+    """Parse a Docker memory size like ``6g`` or ``512m`` (also accepts ``6Gi``) into bytes."""
+    raw = spec.strip().lower()
+    if raw.endswith(("ki", "mi", "gi")):
+        raw = raw[:-1]
+    match = re.fullmatch(r"([1-9]\d*)([bkmg])?", raw)
+    if match is None:
+        raise ValueError(f"invalid memory limit {spec!r}; expected e.g. '6g' or '512m'")
+    return int(match.group(1)) * _MEMORY_UNITS[match.group(2) or "b"]
+
+
+def normalize_memory_limit(spec: str) -> str:
+    """Normalize a memory limit into canonical Docker CLI syntax (e.g. ``'6Gi' -> '6g'``)."""
+    raw = spec.strip().lower()
+    if raw.endswith(("ki", "mi", "gi")):
+        raw = raw[:-1]
+    parse_memory_bytes(raw)
+    return raw
 
 
 class OrchestratorSettings(ModelSettings):
@@ -29,12 +52,20 @@ class JudgeSettings(ModelSettings):
 class SandboxSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    max_workers: int = Field(ge=1)
+    cpus: float = Field(gt=0)
+    memory: str
     cmd_timeout: int = Field(gt=0)
     eval_timeout: int = Field(gt=0)
     api_timeout: float = Field(gt=0)
     gateway_wait_s: float = Field(ge=0)
     obs_char_cap: int = Field(gt=0)
     f2p_only: bool
+
+    @field_validator("memory")
+    @classmethod
+    def _check_memory(cls, value: str) -> str:
+        return normalize_memory_limit(value)
 
 
 class RewardSettings(BaseModel):
@@ -72,18 +103,11 @@ class AgentSettings(BaseModel):
 
 
 class Config(AgentSettings):
+    mode: Literal["train", "val", "inference"] = "inference"
     orchestrator_base_url: str
     orchestrator_api_key: str = Field(repr=False)
     subagent_api_key: str = Field(repr=False)
     judge_api_key: str | None = Field(default=None, repr=False)
-
-    @property
-    def mode(self) -> Literal["train", "val", "inference"]:
-        if "/mode/train/" in self.orchestrator_base_url:
-            return "train"
-        if "/mode/val/" in self.orchestrator_base_url:
-            return "val"
-        return "inference"
 
 
 def load_config() -> Config:
@@ -104,6 +128,7 @@ def load_config() -> Config:
     else:
         subagent_api_key = subagent_api_key or os.environ.get("POLZA_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
     return Config(
+        mode=os.environ.get("AGL_ROLLOUT_MODE") or "inference",  # type: ignore[arg-type]
         orchestrator_base_url=direct or os.environ["AGL_OPENAI_BASE_URL"],
         orchestrator_api_key=(
             os.environ["ORCHESTRATOR_API_KEY"]

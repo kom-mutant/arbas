@@ -7,7 +7,10 @@ from __future__ import annotations
 import pytest
 
 from agentlightning.schemas import Event, Rollout, RolloutConfig, RolloutLifecycleStatus, RolloutState
+from agentlightning.verl import agl_rollout_manager
 from agentlightning.verl.agl_rollout_manager import (
+    AglAsyncRolloutManager,
+    AglRolloutManager,
     AglRolloutManagerBase,
     EnqueuedRollout,
     _aligned_image_urls,
@@ -267,3 +270,74 @@ def test_aligned_image_urls_text_only_rollout_returns_none_without_warning(
     # Text-only rollouts keep the exact original behavior: no alignment, no warning.
     assert _aligned_image_urls(raw_events, 2) is None
     assert capsys.readouterr().out == ""
+
+
+def test_sync_and_async_rollout_managers_print_progress_only_on_change(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(agl_rollout_manager.time, "sleep", lambda _s: None)
+
+    def state_rollout(rid: str, state: RolloutState) -> Rollout:
+        return Rollout(
+            rollout_id=rid,
+            input={"prompt": "hi"},
+            config=RolloutConfig(),
+            status=RolloutLifecycleStatus(state=state, last_attempt_id="0", created_at=0.0, updated_at=1.0),
+        )
+
+    class _SyncStub(AglRolloutManager):
+        def __init__(self) -> None:
+            self._poll_interval_seconds = 0.0
+            self._hooks = None
+            self.states = [
+                state_rollout("r1", RolloutState.RUNNING),
+                state_rollout("r1", RolloutState.RUNNING),
+                state_rollout("r1", RolloutState.SUCCEEDED),
+            ]
+
+        def _create_rollouts(self, data, *, is_train):
+            return [EnqueuedRollout(data_id="d1", rollout_id="r1", step=0, sample_idx_in_step=0, enqueue_time=0.0)]
+
+        def _get_rollout(self, rollout_id):
+            return self.states.pop(0)
+
+        def _fetch_rollout_events(self, rollout_id):
+            return [], []
+
+        def _delete_rollout(self, rollout_id):
+            pass
+
+    _SyncStub().enqueue_and_wait_until_completed({"x": [1]}, is_train=True)
+    sync_lines = [line for line in capsys.readouterr().out.splitlines() if "AglRolloutManager:" in line]
+    assert sync_lines == [
+        "AglRolloutManager: completed=0/1 succeeded=0 failed=0",
+        "AglRolloutManager: completed=1/1 succeeded=1 failed=0",
+    ]
+
+    class _AsyncStub(AglAsyncRolloutManager):
+        def __init__(self) -> None:
+            self._poll_interval_seconds = 0.0
+            self._train_rollout_n = 1
+            self._hooks = None
+            self.states = [
+                state_rollout("r1", RolloutState.RUNNING),
+                state_rollout("r1", RolloutState.RUNNING),
+                state_rollout("r1", RolloutState.SUCCEEDED),
+            ]
+
+        def _create_rollouts(self, data, *, is_train):
+            return [EnqueuedRollout(data_id="d1", rollout_id="r1", step=0, sample_idx_in_step=0, enqueue_time=0.0)]
+
+        def _get_rollout(self, rollout_id):
+            return self.states.pop(0)
+
+        def _fetch_rollout_events(self, rollout_id):
+            return [], []
+
+        def _delete_rollout(self, rollout_id):
+            pass
+
+    _AsyncStub().enqueue_and_wait_until_group_completed({"x": [1]}, [], is_train=True, target_finished_group_num=1)
+    async_lines = [line for line in capsys.readouterr().out.splitlines() if "AglAsyncRolloutManager:" in line]
+    assert async_lines == [
+        "AglAsyncRolloutManager: completed_groups=0/1 finished_rollouts=0/1 succeeded=0 failed=0",
+        "AglAsyncRolloutManager: completed_groups=1/1 finished_rollouts=1/1 succeeded=1 failed=0",
+    ]

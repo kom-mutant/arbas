@@ -1,23 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.resources
 import json
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
-if __package__:
-    from .hierarchical.config import AgentSettings
-    from .pull_images import select_distinct_instances
-else:
-    from hierarchical.config import AgentSettings
-    from pull_images import select_distinct_instances
+from .experiment import load_dataset, load_experiment_config, select_distinct_instances
+from .hierarchical.config import AgentSettings
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = EXAMPLE_DIR / "training.yaml"
@@ -38,51 +35,34 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
-def load_experiment_config(config_path: Path) -> DictConfig:
-    resolved = config_path.expanduser().resolve()
-    config = OmegaConf.load(resolved)
-    if not isinstance(config, DictConfig):
-        raise ValueError(f"Expected mapping in {resolved}")
-    base_file = config.pop("base", None)
-    if base_file:
-        candidate = (resolved.parent / Path(base_file).expanduser()).resolve()
-        base_path = (
-            candidate if candidate.is_file() else (EXAMPLE_DIR / Path(base_file).expanduser()).resolve()
-        )
-        if not base_path.is_file():
-            raise FileNotFoundError(f"Base config not found: {candidate} (or {base_path})")
-        base_cfg = OmegaConf.load(base_path)
-        if "base" in base_cfg:
-            raise ValueError(f"Base config {base_path} cannot include another base config.")
-        config = OmegaConf.merge(base_cfg, config)
-    data = config.get("data")
-    if data is not None:
-        for field in ("train_files", "val_files"):
-            if data.get(field):
-                data[field] = str(resolved.parent / Path(str(data[field])).expanduser())
-    return config
-
-
-def build_agent_config(
-    config_path: Path,
-    run_name: str,
-    config_overrides: Sequence[str] = (),
-) -> str:
-    experiment = load_experiment_config(config_path)
+def resolve_experiment(config_source: Path | DictConfig, config_overrides: Sequence[str] = ()) -> DictConfig:
+    experiment = (
+        copy.deepcopy(config_source) if isinstance(config_source, DictConfig) else load_experiment_config(config_source)
+    )
     if config_overrides:
         experiment = OmegaConf.merge(experiment, OmegaConf.from_dotlist(list(config_overrides)))
+    return experiment
+
+
+def build_agent_config(config_path: Path | DictConfig, config_overrides: Sequence[str] = ()) -> str:
+    experiment = resolve_experiment(config_path, config_overrides)
     agents = OmegaConf.to_container(experiment.agents, resolve=True)
     if not isinstance(agents, dict):
         raise ValueError("agents section in config must be a mapping")
-    oracle = agents.get("oracle")
-    if isinstance(oracle, dict) and oracle.get("checkpoint") == "auto":
-        oracle["checkpoint"] = f"/agl-logs/{run_name}/oracle/linucb.pkl"
-    settings = AgentSettings.model_validate(agents)
-    return settings.model_dump_json()
+    return AgentSettings.model_validate(agents).model_dump_json()
 
 
 def _project(instance: dict[str, Any], agent_config_json: str, run_name: str) -> dict[str, Any]:
     row = {field: instance.get(field) for field in INSTANCE_FIELDS}
+    row["eval_meta"] = json.dumps(
+        {
+            "instance_id": instance.get("instance_id"),
+            "repo": instance.get("repo"),
+            "FAIL_TO_PASS": instance.get("FAIL_TO_PASS") or [],
+            "PASS_TO_PASS": instance.get("PASS_TO_PASS") or [],
+        },
+        ensure_ascii=False,
+    )
     row["arbas_agent_config"] = agent_config_json
     row["agl_run_name"] = run_name
     row["data_source"] = DATA_SOURCE
@@ -98,19 +78,15 @@ def load_split_file(
     run_name: str,
 ) -> list[dict[str, Any]]:
     """Load a pre-split JSONL dataset and project to the VERL schema."""
-    with Path(path).open(encoding="utf-8") as file:
-        rows = [json.loads(line) for line in file if line.strip()]
-    selected = [_project(row, agent_config_json, run_name) for row in rows]
+    selected = [_project(row, agent_config_json, run_name) for row in load_dataset(Path(path))]
     if max_instances:
         selected = selected[:max_instances]
-    if not selected:
-        raise ValueError(f"No instances loaded from {path}")
     return selected
 
 
 def build_config(
     *,
-    config_path: Path = DEFAULT_CONFIG,
+    config_path: Path | DictConfig = DEFAULT_CONFIG,
     agl_base_url: str | None = None,
     agl_key: str | None = None,
     run_name: str | None = None,
@@ -120,67 +96,62 @@ def build_config(
     with initialize_config_dir(config_dir=str(verl_pkg), version_base=None):
         base_cfg = compose(config_name="config")
 
-    overrides = load_experiment_config(config_path)
-    experiment_name = overrides.pop("experiment", {}).get("name", base_cfg.trainer.experiment_name)
+    overrides = resolve_experiment(config_path, config_overrides)
+    experiment_section = overrides.pop("experiment", None)
     overrides.pop("agents", None)
-    base_cfg.agentlightning.k8s.job_template_path = str(EXAMPLE_DIR / "job-template-openai.yaml")
-    base_cfg.agentlightning.local.agent_class = "examples.swe_smith.hierarchical.docker_runner:DockerRunner"
+    experiment_name = (
+        (experiment_section.get("name") if isinstance(experiment_section, Mapping) else None)
+        or OmegaConf.select(overrides, "trainer.experiment_name")
+        or base_cfg.trainer.experiment_name
+    )
+
+    OmegaConf.set_struct(base_cfg, False)
+    base_cfg.agentlightning.local.agent_class = "examples.swe_smith.hierarchical.run:RolloutWorker"
     base_cfg.agentlightning.local.env_map = {
         "IMAGE_NAME": "input.image_name",
         "AGL_TASK_INPUT": "input.problem_statement",
+        "AGL_EVAL_META": "input.eval_meta",
         "ARBAS_AGENT_CONFIG": "input.arbas_agent_config",
         "AGL_RUN_NAME": "input.agl_run_name",
         "DATA_ID": "input.data_id",
     }
+    config = OmegaConf.merge(base_cfg, overrides)
+    OmegaConf.set_struct(config, False)
 
     if agl_base_url:
-        OmegaConf.update(overrides, "agentlightning.agl_base_url", agl_base_url, merge=True)
+        config.agentlightning.agl_base_url = agl_base_url
     if agl_key is not None:
-        OmegaConf.update(overrides, "agentlightning.agl_key", agl_key, merge=True)
+        config.agentlightning.agl_key = agl_key
 
-    cli_override_conf = OmegaConf.from_dotlist(list(config_overrides))
-    cli_override_conf.pop("experiment", None)
-    cli_override_conf.pop("agents", None)
-
-    rollout_mode = OmegaConf.select(
-        cli_override_conf,
-        "actor_rollout_ref.rollout.mode",
-        default=OmegaConf.select(
-            overrides, "actor_rollout_ref.rollout.mode", default=base_cfg.actor_rollout_ref.rollout.mode
-        ),
-    )
-    model_path = OmegaConf.select(
-        cli_override_conf,
-        "actor_rollout_ref.model.path",
-        default=OmegaConf.select(
-            overrides, "actor_rollout_ref.model.path", default=base_cfg.actor_rollout_ref.model.path
-        ),
-    )
+    model_path = str(config.actor_rollout_ref.model.path)
     model_config = Path(model_path) / "config.json"
     model_type = json.loads(model_config.read_text()).get("model_type") if model_config.is_file() else None
     uses_qwen35 = model_type in {"qwen3_5", "qwen3_5_moe"} if model_type else "qwen3.5" in model_path.lower()
-    if uses_qwen35:
-        defaults = {
+    vllm_defaults = (
+        {
             "tool_call_parser": "qwen3_coder",
             "reasoning_parser": "qwen3",
             "chat_template": str(EXAMPLE_DIR / "qwen35_chat_template.jinja"),
         }
-    else:
-        defaults = {"tool_call_parser": "hermes", "chat_template": str(EXAMPLE_DIR / "swe_smith_chat_template.jinja")}
-    existing_vllm = OmegaConf.select(overrides, "actor_rollout_ref.rollout.engine_kwargs.vllm") or OmegaConf.create({})
+        if uses_qwen35
+        else {
+            "tool_call_parser": "hermes",
+            "chat_template": str(EXAMPLE_DIR / "swe_smith_chat_template.jinja"),
+        }
+    )
+    existing_vllm = OmegaConf.select(config, "actor_rollout_ref.rollout.engine_kwargs.vllm") or OmegaConf.create({})
     OmegaConf.update(
-        overrides, "actor_rollout_ref.rollout.engine_kwargs.vllm", OmegaConf.merge(defaults, existing_vllm), merge=True
+        config,
+        "actor_rollout_ref.rollout.engine_kwargs.vllm",
+        OmegaConf.merge(vllm_defaults, existing_vllm),
+        merge=False,
     )
 
-    experiment = OmegaConf.select(overrides, "trainer.experiment_name") or experiment_name
-    exp_full_name = f"{experiment}_{rollout_mode}_{Path(model_path).name}_{TRAIN_BACKEND}"
+    rollout_mode = config.actor_rollout_ref.rollout.mode
+    exp_full_name = f"{experiment_name}_{rollout_mode}_{Path(model_path).name}_{TRAIN_BACKEND}"
     if run_name:
         exp_full_name += f"_{run_name}"
-    OmegaConf.update(overrides, "trainer.experiment_name", exp_full_name, merge=True)
-
-    OmegaConf.set_struct(base_cfg, False)
-    config = OmegaConf.merge(base_cfg, overrides, cli_override_conf)
-    OmegaConf.set_struct(config, False)
+    config.trainer.experiment_name = exp_full_name
     if os.environ.get("AGL_RUN_DIR"):
         config.trainer.default_local_dir = str(Path(os.environ["AGL_RUN_DIR"]) / "checkpoints")
 
@@ -199,17 +170,7 @@ def build_config(
 
 
 def prepare_ray(config: DictConfig) -> None:
-    from ray._private.utils import validate_socket_filepath
     from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
-
-    ray_tmpdir = os.environ.get("RAY_TMPDIR")
-    if ray_tmpdir:
-        session_dir = f"session_2000-01-01_00-00-00_000000_{os.getpid()}"
-        socket_path = Path(ray_tmpdir).absolute() / session_dir / "sockets" / "plasma_store"
-        try:
-            validate_socket_filepath(str(socket_path))
-        except OSError as exc:
-            raise RuntimeError("Ray socket path is too long. Use a shorter AGL_TMPDIR or RAY_TMPDIR.") from exc
 
     env_path = "ray_kwargs.ray_init.runtime_env.env_vars"
     defaults = get_ppo_ray_runtime_env()["env_vars"]
@@ -217,13 +178,14 @@ def prepare_ray(config: DictConfig) -> None:
     env_vars = OmegaConf.merge(defaults, OmegaConf.select(config, env_path))
     if ipc_dir := os.environ.get("VERL_WEIGHT_TRANSFER_IPC_DIR"):
         env_vars.VERL_WEIGHT_TRANSFER_IPC_DIR = ipc_dir
+    if cpath := os.environ.get("CPATH"):
+        env_vars.CPATH = cpath
     OmegaConf.update(config, env_path, env_vars)
 
 
 def train(config: DictConfig, *, agent_config_json: str, run_name: str) -> None:
     runtime_env = config.ray_kwargs.ray_init.runtime_env.env_vars
-    for name in ("MAX_JOBS", "VLLM_USE_FLASHINFER_MOE_FP16"):
-        os.environ[name] = str(runtime_env[name])
+    os.environ["MAX_JOBS"] = str(runtime_env.MAX_JOBS)
 
     import ray
 
@@ -283,13 +245,13 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 def main() -> None:
     args, config_overrides = parse_args()
     run_name = args.run_name or "run"
-    agent_config_json = build_agent_config(args.config, run_name, config_overrides)
+    experiment = resolve_experiment(args.config, config_overrides)
+    agent_config_json = build_agent_config(experiment)
     config = build_config(
-        config_path=args.config,
+        config_path=experiment,
         agl_base_url=args.agl_base_url,
         agl_key=args.agl_key,
         run_name=run_name,
-        config_overrides=config_overrides,
     )
     train(config, agent_config_json=agent_config_json, run_name=run_name)
 

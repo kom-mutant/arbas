@@ -46,6 +46,9 @@ agents:
     reasoning: null
 
   sandbox:
+    max_workers: 8
+    cpus: 1.0
+    memory: 6g
     cmd_timeout: 120
     eval_timeout: 600
     api_timeout: 120
@@ -124,7 +127,6 @@ ray_kwargs:
     runtime_env:
       env_vars:
         MAX_JOBS: "2"
-        VLLM_USE_FLASHINFER_MOE_FP16: "0"
 
 agentlightning:
   max_ppo_update_times: 2
